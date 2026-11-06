@@ -20,13 +20,23 @@ def reply_window_context(function):
     @wraps(function)
     async def wrapped(*args, **kwargs):
         values = parameters.bind_partial(*args, **kwargs).arguments
-        state = {'key': (values['session'], values['user_id']), 'released': False}
+        state = {'key': (values['session'], values['user_id']), 'released': False,
+                 'target':values.get('target'),'target_id':values.get('target_id'),
+                 'user_id':values['user_id'],'role':values.get('role')}
         token = _DELIVERY.set(state)
         try:
             return await function(*args, **kwargs)
         finally:
             _DELIVERY.reset(token)
     return wrapped
+
+
+def current_reply_actor(target, target_id):
+    """Reuse the initiating person only inside the same destination context."""
+    state=_DELIVERY.get()
+    if state and state.get('target')==target and state.get('target_id')==target_id:
+        return state.get('user_id'),state.get('role')
+    return None,None
 
 
 class ReplyWindow:

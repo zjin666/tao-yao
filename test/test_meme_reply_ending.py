@@ -55,6 +55,7 @@ class MemeReplyEndingTests(unittest.IsolatedAsyncioTestCase):
         bot._review_reply_boundary = AsyncMock(return_value=('', ''))
         async def send(*args, **kwargs):
             events.append('text')
+            return True
         async def meme(*args, **kwargs):
             events.append('meme')
             self.assertIn('脸埋枕头', args[2])

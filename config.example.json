@@ -1,5 +1,20 @@
 {
   "bot_name": "桃夭",
+  "impressions": {
+    "enabled": true,
+    "db": "",
+    "minimum_messages": 8,
+    "update_every": 5
+  },
+  "knowledge": {
+    "enabled": true,
+    "db": "",
+    "max_references": 3,
+    "semantic_threshold": 0.55,
+    "summarize": true,
+    "summary_batch_size": 20,
+    "summary_max_chars": 1000
+  },
   "text_provider": "deepseek",
   "qwen": {
     "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -128,7 +143,7 @@
     "topic_similarity_threshold": 0.58,
     "topic_max_chain": 3,
     "topic_min_interval_seconds": 20,
-    "max_consecutive_replies": 7,
+    "max_consecutive_replies": 6,
     "reply_window_seconds": 120,
     "pause_seconds": 120
   },

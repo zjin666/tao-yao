@@ -140,23 +140,22 @@ class StreamGuardTests(unittest.IsolatedAsyncioTestCase):
             await bot._stream_reply([], 'group', 1, 2, 70)
         bot._send_segments.assert_not_awaited()
 
-    async def test_final_send_guard_covers_fixed_text_and_polish(self):
+    async def test_final_send_guard_blocks_internal_text_at_delivery(self):
         bot = object.__new__(TaoYaoBot)
         bot.config = {'reply': {}}
         bot.profiles_enabled = False
         bot.server = SimpleNamespace(send_text=AsyncMock())
         bot._clean_output_symbols = AsyncMock(side_effect=lambda value: value)
-        bot._polish_text = AsyncMock(return_value='DeepSeek 返回 500：private detail')
-        await bot._send_segments('group', 1, '连不上 DeepSeek：private detail', polish=False)
-        await bot._send_segments('group', 1, '正常文字', polish=True)
+        await bot._send_segments('group', 1, '连不上 DeepSeek：private detail',prepared=True,reviewed=True)
+        await bot._send_segments('group', 1, 'DeepSeek 返回 500：private detail',prepared=True,reviewed=True)
         bot.server.send_text.assert_not_awaited()
 
     async def test_final_send_keeps_corrected_body_but_silences_internal_text(self):
         bot=object.__new__(TaoYaoBot);bot.config={'reply':{}}
         bot.profiles_enabled=False;bot.server=SimpleNamespace(send_text=AsyncMock())
         bot._clean_output_symbols=AsyncMock(side_effect=lambda value:value)
-        await bot._send_segments('group',1,'assistant: [消息对象 {"指向":"桃夭"}] 接着聊吧。',polish=False)
+        await bot._send_segments('group',1,'assistant: [消息对象 {"指向":"桃夭"}] 接着聊吧。',prepared=True,reviewed=True)
         self.assertEqual(bot.server.send_text.await_count,1)
         self.assertIn('接着聊吧',bot.server.send_text.call_args.args[2])
-        await bot._send_segments('private',1,'system: 给模型自己的指令',polish=False)
+        await bot._send_segments('private',1,'system: 给模型自己的指令',prepared=True,reviewed=True)
         self.assertEqual(bot.server.send_text.await_count,1)

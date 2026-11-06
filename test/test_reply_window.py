@@ -3,6 +3,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from taoyao.app import TaoYaoBot, PendingMessage
+from taoyao.config import load_config
+from taoyao.persona import load_persona
 from taoyao.reply_window import ReplyWindow, reply_window_context, conversation_session
 
 
@@ -57,19 +59,24 @@ class ReplyWindowTests(unittest.IsolatedAsyncioTestCase):
             if same_user:
                 self.assertAlmostEqual(waits[1], .6)
 
-    async def test_gate_happens_after_polish_and_cleanup(self):
+    async def test_gate_happens_after_normal_generation_and_cleanup(self):
         bot = object.__new__(TaoYaoBot)
-        bot.config = {'reply': {}}
+        bot.config = load_config()
+        bot.config['response_speed']['two_part_reply']=False
+        bot.config['reply'].update(segment_gap_min_seconds=0,segment_gap_max_seconds=0)
+        bot.persona=load_persona()
         bot.profiles_enabled = False
         bot._reply_window = ReplyWindow()
         key = ('private:2', 2)
         bot._reply_window.note(key, 100.0, .8)
         bot.server = SimpleNamespace(send_text=AsyncMock())
         bot._clean_output_symbols = AsyncMock(side_effect=lambda text: text)
-        async def polish(text, profile):
+        async def stream(messages):
             self.clock['mono'] = 11.2
-            return text
-        bot._polish_text = AsyncMock(side_effect=polish)
+            yield '你好。'
+        bot.llm=SimpleNamespace(stream_chat=stream)
+        bot.utility_llm=SimpleNamespace(chat=AsyncMock(return_value='{"allowed":true}'))
+        bot._maybe_send_meme=AsyncMock(return_value=False)
         with patch('taoyao.reply_window.asyncio.sleep', new=AsyncMock()) as sleeper:
             await bot._send_segments('private', 2, '你好。', polish=True, reply_window_key=key)
         sleeper.assert_not_awaited()
@@ -135,10 +142,10 @@ class ReplyWindowTests(unittest.IsolatedAsyncioTestCase):
         bot._clean_output_symbols = AsyncMock(side_effect=lambda text: text)
         bot.server = SimpleNamespace(send_text=AsyncMock())
         with patch('taoyao.app.asyncio.sleep', new=AsyncMock()) as sleeper, patch('taoyao.app.random.uniform', return_value=1.3) as random_gap:
-            await bot._send_segments('group', 1, '第一句。', polish=False, delay=False)
+            await bot._send_segments('group', 1, '第一句。',prepared=True,reviewed=True,delay=False)
             sleeper.assert_not_awaited()
             random_gap.assert_not_called()
-            await bot._send_segments('group', 1, '第二句。', polish=False, delay=True)
+            await bot._send_segments('group', 1, '第二句。',prepared=True,reviewed=True,delay=True)
             sleeper.assert_awaited_once_with(1.3)
             random_gap.assert_called_once_with(1.0, 1.6)
         self.assertEqual(bot.server.send_text.await_count, 2)
