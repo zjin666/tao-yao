@@ -17,15 +17,39 @@ class GroupBudgetTests(unittest.TestCase):
 
     def test_last_round_is_departure_then_pause_expires(self):
         budget = GroupReplyBudget()
-        for now in range(1, 7):
-            self.assertFalse(budget.departure_due(100, now, 7, 120))
-            budget.record(100, now, False, 180)
-        self.assertTrue(budget.departure_due(100, 7, 7, 120))
-        budget.record(100, 7, True, 180)
-        self.assertTrue(budget.paused(100, 186))
-        self.assertFalse(budget.paused(100, 187))
-        self.assertFalse(budget.departure_due(100, 187, 7, 120))
+        for now in range(1, 6):
+            self.assertFalse(budget.departure_due(100, now, 6, 120, user_id=123))
+            budget.record(100, now, False, 120, user_id=123)
+        self.assertTrue(budget.departure_due(100, 6, 6, 120, user_id=123))
+        budget.record(100, 6, True, 120, user_id=123)
+        self.assertTrue(budget.paused(100, 125.99, 123))
+        self.assertFalse(budget.paused(100, 126, 123))
+        self.assertFalse(budget.departure_due(100, 126, 6, 120, user_id=123))
         self.assertFalse(budget.paused(200, 10))
+
+    def test_interleaved_initiators_do_not_share_counts_or_reset_each_other(self):
+        budget=GroupReplyBudget()
+        for now in range(1,6):
+            budget.record(100,now,False,120,user_id=123)
+        budget.record(100,2,False,120,user_id=456)
+        budget.record(100,4,False,120,user_id=456)
+        self.assertTrue(budget.departure_due(100,6,6,120,user_id=123))
+        self.assertFalse(budget.departure_due(100,6,6,120,user_id=456))
+        self.assertFalse(budget.departure_due(200,6,6,120,user_id=123))
+        budget.record(100,6,True,120,user_id=123)
+        self.assertEqual(budget.replies[(100,456)],[2,4])
+        self.assertTrue(budget.paused(100,7,123))
+        self.assertFalse(budget.paused(100,7,456))
+        for now in (7,8,9):budget.record(100,now,False,120,user_id=456)
+        self.assertTrue(budget.departure_due(100,10,6,120,user_id=456))
+
+    def test_six_round_default_and_explicit_window_expiry(self):
+        from taoyao.config import DEFAULTS
+        self.assertEqual(DEFAULTS['group_ambient']['max_consecutive_replies'],6)
+        budget=GroupReplyBudget()
+        for now in range(5):budget.record(100,now,False,120,user_id=123)
+        self.assertTrue(budget.departure_due(100,5,6,120,user_id=123))
+        self.assertFalse(budget.departure_due(100,124,6,120,user_id=123))
 
     def test_expired_replies_do_not_accumulate(self):
         budget = GroupReplyBudget()
@@ -49,6 +73,39 @@ class GroupBudgetTests(unittest.TestCase):
 
 
 class PausedGroupPathsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_handler_counts_the_initiator_even_when_people_interleave(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import AsyncMock, Mock
+        from taoyao.app import TaoYaoBot
+        from taoyao.config import load_config
+        with tempfile.TemporaryDirectory() as folder:
+            cfg=load_config();cfg['memory']['db']=str(Path(folder)/'memory.db')
+            cfg['profile'].update(db=str(Path(folder)/'profiles.db'),enabled=False)
+            cfg['intro']['enabled']=False;cfg['privacy_index']['enabled']=False
+            cfg['memes']['enabled']=cfg['user_memes']['enabled']=False
+            cfg['response_speed'].update(two_part_reply=False,speculative_reply=False,defer_six_axis=False)
+            bot=TaoYaoBot(cfg,mock=True)
+            bot._search_context_for=AsyncMock(return_value='')
+            bot._schedule_reply_extras=Mock()
+            seen=[]
+            async def reply(messages,*args,**kwargs):
+                seen.append((kwargs['viewer_id'],'【本轮群聊收束】' in messages[0]['content']))
+                return '收到。','',False,False
+            bot._stream_reply=reply
+            try:
+                for n,uid in enumerate((123,456,123,456,123,123,123,456,123)):
+                    await bot._handle_text('group',100,'group:100',uid,'测试用户','继续聊','user',True,100,'group',
+                                           from_batch=True,message_id=str(n))
+                self.assertEqual(seen,[(123,False),(456,False),(123,False),(456,False),
+                    (123,False),(123,False),(123,False),(456,False),(123,True)])
+                count=len(seen)
+                await bot._handle_text('group',100,'group:100',123,'测试用户','再说一句','user',True,100,'group',from_batch=True)
+                self.assertEqual(len(seen),count)
+                await bot._handle_text('group',100,'group:100',456,'测试用户','继续','user',True,100,'group',from_batch=True)
+                self.assertEqual(seen[-1],(456,False))
+            finally:bot.memory.close();bot.profiles.close()
+
     async def test_user_pause_blocks_direct_reply_followup_ambient_and_poke(self):
         from taoyao.app import TaoYaoBot
         bot = object.__new__(TaoYaoBot)

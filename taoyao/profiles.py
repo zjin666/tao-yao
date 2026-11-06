@@ -595,6 +595,39 @@ class ProfileStore:
             self._add_message, str(user_id), scene, int(group_id or 0), role, content, message_id, routing
         )
 
+    def _impression_seed(self):
+        # Deliberately do not select personality, scores, summaries or private fields.
+        rows=self._conn.execute("SELECT m.id,m.user_id,m.group_id,m.role,m.routing,m.content,m.message_id,m.created_at,p.nickname,p.basic_info_group FROM user_messages m LEFT JOIN profiles p ON p.user_id=m.user_id WHERE m.scene='group' AND m.role IN ('user','assistant') AND m.group_id>0 ORDER BY m.id DESC LIMIT 6000").fetchall()
+        previous={};interacted=[]
+        for row in reversed(rows):
+            r=dict(row);prior=previous.get(r['group_id'])
+            previous[r['group_id']]=r
+            if r['role']!='assistant' or not prior or prior['role']!='user' or prior['user_id']!=r['user_id']:continue
+            try:
+                source=json.loads(prior.get('routing') or '{}');reply=json.loads(r.get('routing') or '{}')
+                elapsed=(datetime.fromisoformat(r['created_at'])-datetime.fromisoformat(prior['created_at'])).total_seconds()
+                if source.get('state')=='bot' and reply.get('evidence')=='bot_reply' and str(reply.get('target_user_id'))==str(r['user_id']) and 0<=elapsed<=180:
+                    interacted.append(prior)
+            except (ValueError,TypeError,AttributeError):continue
+        counts={};result=[]
+        for row in reversed(interacted):
+            r=dict(row);key=(r['user_id'],r['group_id'])
+            if counts.get(key,0)>=40:continue
+            counts[key]=counts.get(key,0)+1
+            names=[r.get('nickname') or '']
+            try:
+                info=json.loads(r.get('basic_info_group') or '{}').get(str(r['group_id']),{})
+                names.append(info.get('name') or '')
+                for field in ('aliases','nicknames'):
+                    if isinstance(info.get(field),list):names.extend(info[field])
+            except (ValueError,AttributeError):pass
+            result.append({'user_id':r['user_id'],'group_id':r['group_id'],'names':names,
+                'content':r['content'],'message_key':r['message_id'] or 'history:'+str(r['id']),
+                'sent_at':r['created_at']})
+        return list(reversed(result))
+
+    async def impression_seed(self):return await self._run(self._impression_seed)
+
     def _add_update(self, user_id: str, content: str, details: dict) -> None:
         with self._conn:
             self._conn.execute(
