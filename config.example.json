@@ -1,0 +1,242 @@
+{
+  "bot_name": "桃夭",
+  "text_provider": "deepseek",
+  "qwen": {
+    "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "model": "qwen3.7-plus",
+    "key_file": "private/qwen-key.txt",
+    "thinking": false,
+    "temperature": 1.0,
+    "max_tokens": 600,
+    "timeout": 60
+  },
+  "language_analysis": {
+    "enabled": true,
+    "directory": "data/annotation_samples",
+    "model": "deepseek-flash",
+    "thinking": false,
+    "timeout": 15,
+    "max_tokens": 1800,
+    "minimum_confidence": 0.65,
+    "concurrency": 2,
+    "context_messages": 6,
+    "timezone": "Asia/Shanghai",
+    "background_group_probability": 0.1
+  },
+  "onebot": {
+    "host": "127.0.0.1",
+    "port": 6199,
+    "access_token": ""
+  },
+  "deepseek": {
+    "api_base": "https://api.deepseek.com/v1",
+    "model": "deepseek-chat",
+    "key_file": "private/deepseek-key.txt",
+    "temperature": 1.0,
+    "max_tokens": 600,
+    "timeout": 60,
+    "thinking": false
+  },
+  "owner_qq": 0,
+  "allowed_groups": [],
+  "group_require_at": true,
+  "roles": {
+    "allow_user_private": true,
+    "allow_all_groups": false,
+    "auto_whitelist_joined_groups": true,
+    "owner_group_require_at": true,
+    "user_context_messages": 6,
+    "group_context_messages": 10,
+    "user_max_segments": 2,
+    "user_max_chars": 500,
+    "user_rate_seconds": 2,
+    "user_rate_per_minute": 12,
+    "user_meme_probability": 0.2
+  },
+  "batch": {
+    "enabled": true,
+    "window_seconds": 0.8,
+    "max_messages": 6
+  },
+  "links": {
+    "enabled": true,
+    "timeout": 15,
+    "max_chars": 2000,
+    "max_bytes": 1048576,
+    "max_urls": 2
+  },
+  "media_memory": {
+    "enabled": true,
+    "dir": "data/media_memory",
+    "ttl_seconds": 86400,
+    "max_items": 8
+  },
+  "search": {
+    "fast_daily_gate": true,
+    "enabled": true,
+    "max_results": 5,
+    "decision_llm": true
+  },
+  "poke": {
+    "enabled": true,
+    "cooldown_seconds": 5
+  },
+  "poke_reply": {
+    "enabled": true,
+    "emotion_probability": 0.2,
+    "notify_poke_probability": 0.55,
+    "recent_poke_seconds": 900,
+    "flow_seconds": 300,
+    "cooldown_seconds": 60,
+    "max_per_hour": 4
+  },
+  "group_tasks": {
+    "enabled": true,
+    "max_targets": 10
+  },
+  "memory_requests": {
+    "enabled": true,
+    "max_chars": 500,
+    "max_items": 12
+  },
+  "qzone": {
+    "enabled": true,
+    "post_cooldown_seconds": 120,
+    "max_chars": 500,
+    "read_limit": 3
+  },
+  "intro": {
+    "enabled": true,
+    "include_owner": false,
+    "text": "……你好。我是桃夭。\n平时话不多，但不代表我没在听。\n以后请多关照。……先说好，我可不是对谁都这么客气。"
+  },
+  "group_join_greeting": {
+    "enabled": true,
+    "text": "大家好，我是桃夭。以后请多关照。"
+  },
+  "group_ambient": {
+    "enabled": true,
+    "threshold": 8,
+    "probability": 0.35,
+    "dice_probability": 0.08,
+    "no_target_probability": 0.4,
+    "broad_target_probability": 0.6,
+    "bot_target_probability": 0.8,
+    "cooldown_seconds": 300,
+    "max_per_hour": 3,
+    "topic_continuation_seconds": 900,
+    "topic_similarity_threshold": 0.58,
+    "topic_max_chain": 3,
+    "topic_min_interval_seconds": 20,
+    "max_consecutive_replies": 7,
+    "reply_window_seconds": 120,
+    "pause_seconds": 120
+  },
+  "group_topics": {
+    "enabled": true,
+    "per_day": 2,
+    "quiet_minutes": 45,
+    "active_start_hour": 9,
+    "active_end_hour": 23,
+    "min_gap_minutes": 180,
+    "timezone": "Asia/Shanghai"
+  },
+  "greetings": {
+    "enabled": true,
+    "morning_hour": 8,
+    "night_hour": 23,
+    "window_minutes": 10,
+    "include_owner": true,
+    "check_seconds": 30
+  },
+  "vision": {
+    "enabled": true,
+    "provider": "api",
+    "api_base": "https://api.deepseek.com/v1",
+    "model": "deepseek-flash",
+    "api_key_file": "private/deepseek-key.txt",
+    "max_frames": 4,
+    "max_tokens": 2000,
+    "max_media_mb": 20,
+    "max_upload_mb": 6,
+    "timeout": 90,
+    "work_dir": "data/media",
+    "detail": "low"
+  },
+  "reply": {
+    "segment": true,
+    "max_chars": 70,
+    "max_segments": 4,
+    "context_messages": 16,
+    "polish_fixed": true,
+    "segment_gap_min_seconds": 1.0,
+    "segment_gap_max_seconds": 1.6
+  },
+  "memes": {
+    "enabled": true,
+    "dir": "memes",
+    "probability": 0.35
+  },
+  "user_memes": {
+    "enabled": true,
+    "dir": "user_memes",
+    "store_probability": 0.08,
+    "use_probability": 0.15,
+    "min_description_chars": 4,
+    "min_use_score": 0.42,
+    "max_files": 200
+  },
+  "profile": {
+    "enabled": true,
+    "db": "data/profiles.db",
+    "context_messages": 12,
+    "summarize_after": 50,
+    "summary_max_chars": 500,
+    "summary_keep_raw": 35,
+    "llm_extract": true,
+    "default_timezone": "Asia/Shanghai",
+    "scoring": {
+      "ema_alpha": 0.45,
+      "max_single_delta": 7,
+      "delta_scale": 1.2,
+      "confidence_power": 0.7,
+      "confidence_floor": 0.35
+    },
+    "classifier": "local",
+    "local_high_confidence": 0.55,
+    "local_low_confidence": 0.35,
+    "local_tie_break_margin": 0.0,
+    "embedding_model": "models/bge-small-zh-v1.5",
+    "embedding_device": "auto",
+    "embedding_threshold": 0.48,
+    "embedding_temperature": 0.06,
+    "adapt_strength": 0.4,
+    "band_current_weight": 0.6
+  },
+  "memory": {
+    "enabled": true,
+    "db": "data/tao-yao.db",
+    "summarize_every": 20,
+    "summary_max_chars": 700
+  },
+  "mock_llm": false,
+  "log_level": "INFO",
+  "group_followup_seconds": 40,
+  "group_followup_similarity": 0.5,
+  "group_followup_use_llm": true,
+  "response_speed": {
+    "speculative_reply": true,
+    "defer_six_axis": true,
+    "fast_helpers": true,
+    "utility_model": "deepseek-flash",
+    "utility_max_tokens": 220,
+    "utility_timeout": 12,
+    "two_part_reply": true
+  },
+  "privacy_index": {
+    "enabled": true,
+    "db": "private/privacy-index.sqlite3",
+    "interval_seconds": 60,
+    "batch_size": 8
+  }
+}

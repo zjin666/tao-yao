@@ -1,0 +1,30 @@
+# Credentials and local private state
+/private/
+**/*-key.txt
+.env
+.env.*
+!.env.example
+/config.json
+
+# Chat history, profiles, logs and backups
+/data/
+/logs/
+/backups/
+/user_memes/
+*.db
+*.db-*
+*.sqlite3
+*.sqlite3-*
+
+# Downloaded models and executables
+/models/
+/bin/
+
+# Python and editor caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.idea/
+.vscode/
