@@ -11,6 +11,7 @@
 /logs/
 /backups/
 /user_memes/
+/experiments/
 *.db
 *.db-*
 *.sqlite3

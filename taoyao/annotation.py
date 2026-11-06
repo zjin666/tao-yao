@@ -116,11 +116,18 @@ class SampleStore:
             row.update(primary=primary, local=local, review_reasons=sorted(set(reasons)))
             atomic_json(self.path(sid),row)
 
-    def review(self, sid, labels, reviewer, note='', reject=False):
+    def review(self, sid, labels, reviewer, note='', reject=False, reviewer_kind='human', confirmed_axes=None):
+        if reviewer_kind not in ('human', 'assistant'):
+            raise ValueError('reviewer_kind must be human or assistant')
         if not reviewer.strip():
             raise ValueError('Reviewer is required')
+        axes = list(DIMENSIONS if confirmed_axes is None else confirmed_axes) if reviewer_kind == 'human' else []
+        if len(set(axes)) != len(axes) or not set(axes) <= set(DIMENSIONS):
+            raise ValueError('Invalid confirmed_axes')
         with self.locked():
             row=self.read(sid)
+            if reviewer_kind == 'assistant' and row['human_review']['status'] in ('confirmed', 'rejected'):
+                raise ValueError('Assistant review cannot replace a human decision')
             spec=json.loads((self.root/'definitions'/f"{row['definition_version']}.json").read_text(encoding='utf-8'))
             if not reject:
                 if set(labels)!=set(DIMENSIONS):
@@ -132,8 +139,12 @@ class SampleStore:
             history=old.get('history',[])
             if old['status']!='pending':
                 history=history+[{k:v for k,v in old.items() if k!='history'}]
-            row['human_review']=dict(status='rejected' if reject else 'confirmed', labels={} if reject else labels,
-                reviewer=reviewer, note=note, reviewed_at=datetime.now(timezone.utc).isoformat(), history=history)
+            status = ('rejected' if reject else 'confirmed') if reviewer_kind == 'human' else ('assistant_rejected' if reject else 'assistant_reviewed')
+            row['human_review']=dict(status=status, labels={} if reject else labels,
+                reviewer=reviewer, reviewer_kind=reviewer_kind, note=note,
+                confirmed_axes=axes,
+                axis_provenance={d:'human_confirmed' if d in axes else 'assistant_reviewed' for d in labels},
+                reviewed_at=datetime.now(timezone.utc).isoformat(), history=history)
             atomic_json(self.path(sid),row)
 
 

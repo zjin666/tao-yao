@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .personality import merge_traits, is_tao_nickname_fragment
+from .name_preferences import remove_disallowed_names
 
 DEFAULT_SCORES = {"AGG": 50.0, "INT": 50.0, "HUM": 50.0, "DEP": 50.0, "RAT": 50.0, "ACT": 50.0}
 
@@ -418,10 +419,12 @@ class ProfileStore:
                     [str(x).strip() for x in old if str(x).strip()]
                     + [str(x).strip() for x in value if str(x).strip()]
                 ))[:8]
+            elif key == 'disallowed_names' and isinstance(value,list):
+                current[key]=list(dict.fromkeys([*(current.get(key) or []),*value]))
             else:
                 # 名字/年龄/性别/所在地等标量：新值直接覆盖旧值。
                 current[key] = value
-        return current
+        return remove_disallowed_names(current)
 
     def _update_basic_info(self, user_id: str, info: dict, scene: str, group_id: int = 0) -> None:
         row = self._conn.execute(
@@ -435,6 +438,9 @@ class ProfileStore:
                 return json.loads(value or "{}")
             except json.JSONDecodeError:
                 return {}
+        info=dict(info)
+        blocked=load(row['basic_info']).get('disallowed_names') or []
+        if blocked:info['disallowed_names']=list(dict.fromkeys([*blocked,*(info.get('disallowed_names') or [])]))
         combined = self._merge_basic_info(load(row["basic_info"]), info)
         group_map = load(row["basic_info_group"])
         # 兼容旧的扁平 group 信息，包到 group_id=0 下，不再跨群混用。
@@ -463,6 +469,24 @@ class ProfileStore:
     ) -> None:
         if info:
             await self._run(self._update_basic_info, str(user_id), info, scene, int(group_id or 0))
+
+    def _reject_user_names(self, user_id: str, names: list[str]) -> None:
+        row=self._conn.execute('SELECT basic_info,basic_info_private,basic_info_group FROM profiles WHERE user_id=?',(user_id,)).fetchone()
+        if row is None:return
+        combined,private,groups=(json.loads(value or '{}') for value in row)
+        combined=remove_disallowed_names(combined,names)
+        private=remove_disallowed_names(private,names)
+        # Only this user's alias fields, including stale copies in other scenes.
+        if any(k in groups for k in ('name','aliases','nicknames')):
+            groups=remove_disallowed_names(groups,names)
+        else:
+            groups={gid:remove_disallowed_names(value,names) for gid,value in groups.items()}
+        with self._conn:
+            self._conn.execute('UPDATE profiles SET basic_info=?,basic_info_private=?,basic_info_group=?,updated_at=? WHERE user_id=?',
+                (json.dumps(combined,ensure_ascii=False),json.dumps(private,ensure_ascii=False),json.dumps(groups,ensure_ascii=False),_now(),user_id))
+
+    async def reject_user_names(self, user_id: int | str, names: list[str]) -> None:
+        if names:await self._run(self._reject_user_names,str(user_id),names)
 
     def _set_summary(self, user_id: str, summary: str, upto: int) -> None:
         with self._conn:

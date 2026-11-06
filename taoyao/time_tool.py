@@ -44,10 +44,12 @@ def needs_clock(text, context=''):
                  r'(?:现在|今天)(?:是)?(?:星期几|周几|几号|哪年)|(?:再过|还有).{0,8}(?:小时|分钟|天).{0,8}(?:几点|几号|日期|星期|周几)|'
                  r'时差|/时间|/日期|/时区|今天.{0,6}(?:多少号|什么日期)|现在.{0,6}(?:几月|早上还是晚上)|(?:距离|离).{0,16}还有几天', value):
         return True
-    if re.search(r'(?:几点|几号|星期几|周几|日期是多少|日期是什么|什么时间|什么日期)[？?]?$|^(?:时间|日期)[？?]$', value):
+    if re.search(r'(?:几点|几号|星期几|周几|日期是多少|日期是什么|什么时间|什么日期)(?:了|钟|了吗|呢|啊|呀|吗|么)?[？?]?$|^(?:时间|日期)[？?]$', value):
         return True
     if re.search(r'(?:今天|明天|后天|昨天).{0,8}(?:星期|周)[一二三四五六日天1-7].{0,3}(?:吗|么|？|\?)|(?:能|可以).{0,8}(?:查|获取|知道).{0,5}(?:日期|时间)|(?:离|距离).{0,16}(?:还有多久|还剩多久)', value):
         return True
+    if context and re.search(r'(?:明明|不对|应该|不是).{0,8}(?:早上|上午|中午|下午|晚上|凌晨|点半|点钟|时间)', value):
+        return needs_clock(context[-600:])
     # A short followup to an actual time question may specify another place.
     return bool(requested_zone(value) and re.search(r'呢|那边|这边|当地', value)
                 and context and needs_clock(context[-600:]))

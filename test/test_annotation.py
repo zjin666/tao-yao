@@ -117,4 +117,33 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(store.read(rows[-1]['id'])['human_review']['status'],'rejected')
             with self.assertRaises(ValueError):store.read('../escape')
 
+class ReviewProvenanceTests(unittest.TestCase):
+    def test_partial_chat_confirmation_exports_only_explicit_axes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store=SampleStore(directory)
+            row=store.create(text='只是玩笑',raw_text='只是玩笑',context=[],user_id=1,scene='private',group_id=0)
+            labels={d:'中性' for d in DIMENSIONS};labels['HUM']='轻松玩笑'
+            store.review(row['id'],labels,'User via chat',confirmed_axes=['AGG','HUM'])
+            out=Path(directory)/'export.json';export(store,contract()[0],out)
+            rows=json.loads(out.read_text(encoding='utf-8'))['rows']
+            self.assertEqual({r['dimension'] for r in rows},{'AGG','HUM'})
+
+    def test_assistant_review_is_not_human_gold_and_human_can_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store=SampleStore(directory)
+            row=store.create(text='你好',raw_text='你好',context=[],user_id=1,scene='private',group_id=0)
+            labels={d:'中性' for d in DIMENSIONS};labels['INT']='社交礼仪'
+            store.review(row['id'],labels,'Codex',reviewer_kind='assistant')
+            self.assertEqual(store.read(row['id'])['human_review']['status'],'assistant_reviewed')
+            out=Path(directory)/'export.json';export(store,contract()[0],out)
+            self.assertEqual(json.loads(out.read_text(encoding='utf-8'))['rows'],[])
+            store.review(row['id'],labels,'Human',reviewer_kind='human')
+            human=store.read(row['id'])['human_review']
+            self.assertEqual(human['status'],'confirmed')
+            self.assertEqual(human['history'][0]['reviewer_kind'],'assistant')
+            with self.assertRaises(ValueError):
+                store.review(row['id'],labels,'Codex',reviewer_kind='assistant')
+            export(store,contract()[0],out)
+            self.assertEqual(len(json.loads(out.read_text(encoding='utf-8'))['rows']),6)
+
 if __name__=='__main__':unittest.main()
