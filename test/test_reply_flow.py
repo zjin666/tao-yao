@@ -58,18 +58,20 @@ class ReplyFlowTests(unittest.TestCase):
 
 
 class ReplyFlowStreamTests(unittest.IsolatedAsyncioTestCase):
-    async def test_reviewer_only_accepts_four_categories_with_verbatim_evidence(self):
+    async def test_reviewer_uses_single_contract_and_never_passes_unknown_decisions(self):
         bot = object.__new__(TaoYaoBot)
         bot.llm = SimpleNamespace(chat=AsyncMock())
         reply = '你这脑洞也太会拐弯了吧。'
         for verdict in (
             '{"allowed":false,"reason":"style","evidence":"脑洞"}',
             '{"allowed":false,"reason":"unsupported_action","evidence":"脑洞"}',
-            '{"allowed":false,"reason":"intimacy","evidence":"不存在的内容"}',
-            '{"allowed":false,"reason":"intimacy"}',
         ):
             bot.llm.chat.return_value = verdict
-            self.assertEqual(await bot._review_reply_boundary(reply, [], {}), ('', ''))
+            self.assertEqual(await bot._review_reply_boundary(reply, [], {}), ('boundary_review_unavailable', ''))
+        for verdict in ('{"allowed":false,"reason":"intimacy","evidence":"不存在的内容"}',
+                        '{"allowed":false,"reason":"intimacy"}'):
+            bot.llm.chat.return_value=verdict
+            self.assertEqual(await bot._review_reply_boundary(reply, [], {}),('intimacy',''))
         bot.llm.chat.return_value = '{"allowed":false,"reason":"privacy","evidence":"秘密原文"}'
         self.assertEqual(await bot._review_reply_boundary('秘密原文', [], {}), ('privacy', '秘密原文'))
 
@@ -118,7 +120,7 @@ class ReplyFlowStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(generated), 1)
         self.assertEqual(result[0], '这下接上啦。')
         bot.llm.chat.assert_awaited_once()
-        self.assertIn('不改写回复', bot.llm.chat.call_args.args[0][0]['content'])
+        self.assertIn('不润色', bot.llm.chat.call_args.args[0][0]['content'])
 
     async def test_unavailable_review_has_no_outward_side_effects(self):
         bot = object.__new__(TaoYaoBot)

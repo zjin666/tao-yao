@@ -281,6 +281,34 @@ class TwoPartProductionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.call(bot))[0],'')
         bot.server.send_text.assert_not_awaited()
 
+    async def test_address_diagnostic_stays_internal(self):
+        async def stream(messages):yield '哥哥刚才说晚点回来。'
+        bot=self.bot(stream)
+        bot.utility_llm.chat.return_value='{"address_target":"owner","allowed":true}'
+        result=await self.call(bot)
+        self.assertIn('哥哥刚才说晚点回来',result[0])
+        bot.server.send_text.assert_awaited()
+        self.assertNotIn('"address_target"',bot.server.send_text.await_args.args[2])
+
+    async def test_third_person_diagnostic_does_not_override_privacy_block(self):
+        async def stream(messages):yield '哥哥私聊告诉我的银行卡密码是虚构测试密码。'
+        bot=self.bot(stream)
+        bot.utility_llm.chat.return_value='{"address_target":"owner","allowed":false,"reason":"privacy"}'
+        self.assertEqual((await self.call(bot))[0],'')
+        bot.server.send_text.assert_not_awaited()
+
+    async def test_streamed_and_complete_replies_use_the_same_single_checker(self):
+        prompts=[]
+        for two_part in (True,False):
+            async def stream(messages):yield '我在听，你慢慢说。'
+            bot=self.bot(stream)
+            bot.config['response_speed']['two_part_reply']=two_part
+            await self.call(bot)
+            bot.server.send_text.assert_awaited()
+            bot.utility_llm.chat.assert_awaited_once()
+            prompts.append(bot.utility_llm.chat.await_args.args[0][0]['content'])
+        self.assertEqual(prompts[0],prompts[1])
+
     async def test_streaming_candidate_is_reused_before_completion_and_canceled_if_stale(self):
         release=asyncio.Event();entered=asyncio.Event()
         async def stream(messages):
