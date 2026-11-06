@@ -23,11 +23,13 @@ def queue(store, limit):
     pending.sort(key=lambda r:(-rank(r),r['collected_at'],r['id']))
     items=[]
     for row in pending[:limit]:
-        labels={d:(row.get('primary') or {}).get('labels',{}).get(d,{}).get('bucket','unknown') for d in DIMENSIONS}
+        suggestions=(row.get('assistant_review') or {}).get('labels',{})
+        labels={d:suggestions.get(d,(row.get('primary') or {}).get('labels',{}).get(d,{}).get('bucket','unknown')) for d in DIMENSIONS}
         items.append(dict(sample_id=row['id'],text=row['text'],raw_text=row['raw_text'],context=row['context'],
             sent_at=row['sent_at'],timezone=row['timezone'],scene=row['scene'],definition_version=row['definition_version'],
             reasons=row['review_reasons'],primary=row['primary'],local=row['local'],
-            decision='pending',labels=labels,reviewer='',note=''))
+            decision='pending',labels=labels,reviewer='',reviewer_kind='human',
+            note=(row.get('assistant_review') or {}).get('note','')))
     # Timestamped editable queues: generating another queue never erases unfinished edits.
     from datetime import datetime,timezone
     path=store.root/'review'/('queue-'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')+'.json')
@@ -44,7 +46,8 @@ def apply(store, path):
         if decision not in ('confirm','reject'):raise ValueError('decision must be pending/confirm/reject')
         row=store.read(item['sample_id'])
         if row['definition_version']!=item['definition_version']:raise ValueError('Definition mismatch')
-        store.review(row['id'],item['labels'],item['reviewer'],item.get('note',''),reject=decision=='reject')
+        store.review(row['id'],item['labels'],item['reviewer'],item.get('note',''),reject=decision=='reject',
+            reviewer_kind=item.get('reviewer_kind','human'),confirmed_axes=item.get('confirmed_axes'))
         count+=1
     print(f'Applied {count} human reviews. No training or live score changes.')
 
@@ -73,6 +76,7 @@ def export(store, version, output):
         number=int(group[:8],16)%100
         split='train' if number<80 else 'dev' if number<90 else 'test'
         for dim,bucket in r['human_review']['labels'].items():
+            if dim not in r['human_review'].get('confirmed_axes',DIMENSIONS):continue
             if bucket=='unknown':continue
             # Identical messages do not gain extra weight just by repeated sending.
             key=(r['text'],dim,bucket)

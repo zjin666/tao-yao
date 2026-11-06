@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import save_config
+from .name_preferences import rejected_user_names, name_key
 from .annotation import AnalysisPipeline
 from .guard import Guard
 from .linkreader import LinkReader, extract_links
@@ -1104,6 +1105,8 @@ class TaoYaoBot:
             bits.append(f"时区 {info['timezone']}")
         if info.get("tao_nickname"):
             bits.append(f"对桃夭的称呼 {info['tao_nickname']}")
+        if info.get('disallowed_names'):
+            bits.append('当前用户明确拒绝的称呼 '+ '、'.join(info['disallowed_names'])+'；不要用来称呼用户，也不要复述名单；此偏好优先于旧摘要和平台显示名')
         return "；".join(bits) or "暂无"
 
     def _timezone_for(self, profile: dict | None) -> str:
@@ -1215,6 +1218,9 @@ class TaoYaoBot:
         if not profile:
             return ""
         info = profile.get("basic_info") or {}
+        blocked=info.get('disallowed_names') or []
+        display_nickname=profile.get('nickname') or '未知'
+        if name_key(display_nickname) in {name_key(n) for n in blocked}:display_nickname='未指定可用称呼'
         tao_nick = str((profile.get("basic_info") or {}).get("tao_nickname") or "").strip()
         nick_part = f"此用户对桃夭的叫法：{tao_nick}（不是用户昵称，也不要求桃夭反复自称）；" if tao_nick else ""
         # 群聊只用群内可见信息：不带私聊基础信息、私聊摘要和私聊性格描述。
@@ -1222,9 +1228,10 @@ class TaoYaoBot:
             group_map = profile.get("basic_info_group") or {}
             group_info = group_map.get(str(int(group_id or 0)), {}) if isinstance(group_map, dict) else {}
             shared = dict(group_info or {})
+            if blocked:shared['disallowed_names']=blocked
             summary_part = f"群聊摘要：{group_summary}；" if group_summary else ""
             return (
-                f"昵称：{profile.get('nickname') or '未知'}；"
+                f"昵称：{display_nickname}；"
                 f"身份：{profile.get('role') or 'user'}；"
                 f"共享基础信息：{self._profile_info_text(shared, include_hobbies=True)}；"
                 f"{summary_part}"
@@ -1236,7 +1243,7 @@ class TaoYaoBot:
         summary = str(profile.get("summary") or "").strip()
         summary_part = f"摘要：{summary}；" if summary else ""
         return (
-            f"昵称：{profile.get('nickname') or '未知'}；"
+            f"昵称：{display_nickname}；"
             f"身份：{profile.get('role') or 'user'}；"
             f"基础信息：{self._profile_info_text(merged, include_hobbies=True)}；"
             f"{nick_part}"
@@ -1348,7 +1355,7 @@ class TaoYaoBot:
             personality = describe_scores(result)
             await self.profiles.update_scores(profile["user_id"], result, personality)
             await self.profiles.add_update(profile["user_id"], text, {"dimensions": details, "annotation_sample_id": sample_id})
-            info = extract_basic_info(text)
+            info = extract_basic_info(raw_text if raw_text is not None else text)
             if info:
                 await self.profiles.update_basic_info(
                     profile["user_id"], info, scene=scene, group_id=group_id
@@ -1634,10 +1641,12 @@ class TaoYaoBot:
                 trigger_profile = None
         raw_message = str(data.get("raw_message") or text)
         tao_nick = str(((trigger_profile or {}).get("basic_info") or {}).get("tao_nickname") or "").strip()
-        nickname_request = parse_tao_nickname_request(text)
+        rejected_names = rejected_user_names(text, (str(self.config.get('bot_name') or '桃夭'), tao_nick))
+        nickname_request = parse_tao_nickname_request(text) or bool(rejected_names)
         nickname_targeted = bool(nickname_request) and (
             self._is_at_bot(data)
-            or bool(tao_nick and tao_nick in raw_message)
+            or bool(tao_nick and (text.lstrip().startswith(tao_nick) if rejected_names else tao_nick in raw_message))
+            or bool(rejected_names and text.lstrip().startswith(str(self.config.get('bot_name') or '桃夭')))
         )
         if nickname_request and not nickname_targeted:
             reply_id = self._extract_reply_id(data)
@@ -1649,7 +1658,7 @@ class TaoYaoBot:
                     nickname_targeted = bool(quoted and quoted.get("role") == "assistant")
                 except Exception:
                     pass
-        if nickname_request and not nickname_targeted and group_id and self.profiles_enabled:
+        if nickname_request and not rejected_names and not nickname_targeted and group_id and self.profiles_enabled:
             nickname_targeted = await self._nickname_context_targets_bot(
                 text, group_id, user_id
             )
@@ -3665,6 +3674,20 @@ class TaoYaoBot:
             await self._maybe_intro(profile, target, target_id, user_id, role, is_group)
 
         command = text.strip()
+        bot_alias = str(((profile or {}).get('basic_info') or {}).get('tao_nickname') or '')
+        rejected_names = rejected_user_names(raw_text if raw_text is not None else text,
+            (str(self.config.get('bot_name') or '桃夭'), bot_alias))
+        if rejected_names:
+            route=getattr(self,'_group_routes',{}).get((group_id,message_id),{})
+            directed=not is_group or (
+                not ambient and route.get('state') not in ('other','unknown') and (
+                    route.get('evidence') in ('explicit_at','reply') or nickname_targeted))
+            if not directed:
+                return
+            if profile:
+                await self.profiles.reject_user_names(user_id,rejected_names)
+                await self._send_segments(target,target_id,'好，以后不这样叫你。',polish=False)
+            return
         reported_nickname = is_reported_tao_nickname(text)
         if role == "owner" and not is_group:
             if await self._handle_owner_group_task(

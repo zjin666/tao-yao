@@ -364,7 +364,7 @@ _TIMEZONE_HINTS = {
     "香港": "Asia/Hong_Kong", "台北": "Asia/Taipei", "台湾": "Asia/Taipei",
     "东京": "Asia/Tokyo", "日本": "Asia/Tokyo", "首尔": "Asia/Seoul",
     "韩国": "Asia/Seoul", "新加坡": "Asia/Singapore",
-    "纽约": "America/New_York", "洛杉矶": "America/Los_Angeles",
+    "纽约": "America/New_York", "New York": "America/New_York", "NYC": "America/New_York", "洛杉矶": "America/Los_Angeles",
     "加州": "America/Los_Angeles", "西雅图": "America/Los_Angeles",
     "伦敦": "Europe/London", "巴黎": "Europe/Paris", "柏林": "Europe/Berlin",
     "悉尼": "Australia/Sydney", "墨尔本": "Australia/Melbourne",
@@ -382,6 +382,31 @@ def _valid_timezone(value: str) -> str:
         return value
     except Exception:
         return ""
+
+
+def explicit_user_timezone(text: str) -> str:
+    """Current self-location/zone assertions only, not cities in clock questions."""
+    # Generated media memories and quoted location examples are not declarations.
+    text = re.split(r'\n\[(?:最近图片记忆|图片内容|视频内容)\]', str(text or ''), maxsplit=1)[0]
+    aliases = '|'.join(re.escape(k) for k in sorted(_TIMEZONE_HINTS, key=len, reverse=True))
+    zone_value = rf'(?:[A-Za-z_]+/[A-Za-z_]+(?:/[A-Za-z_]+)?|{aliases})'
+    declaration = re.compile(
+        rf'(?:我(?:现在|目前|此刻|最近|已经|刚)?(?:就)?(?:在|住在|搬到|搬来|搬去|人在)|'
+        rf'我(?:这边|这里)(?:现在|目前)?(?:是|在)|我的(?:所在地|位置|时区)(?:是|在|为)|'
+        rf'\bI(?:\s+am|\x27m)\s+(?:currently\s+)?(?:in|living\s+in|based\s+in)\s+)'
+        rf'\s*[:：]?\s*(?P<value>{zone_value})(?![A-Za-z_\d/:])', re.I)
+    answer = ''
+    for match in declaration.finditer(text):
+        prefix = re.split(r'[，,。！？!?；;\n]', text[:match.start()])[-1]
+        if re.search(r'假如|如果|比如|举例|他说|她说|他说的|转述|你说|不是说|并不是|不代表|不表示|[“"「『]|\bsaid\b', prefix, re.I):
+            continue
+        if re.match(r'\s*(?:时间|时区)?\s*(?:吗|么|还是|是否|是不是|[？?])', text[match.end():]):
+            continue
+        if re.match(r'的(?:朋友|同事|家人|客户|亲戚|同学)', text[match.end():]):
+            continue
+        value = match['value']
+        answer = _valid_timezone(value) or next((zone for alias,zone in _TIMEZONE_HINTS.items() if alias.casefold()==value.casefold()), '')
+    return answer
 
 
 def _looks_like_person_name(text: str) -> bool:
@@ -598,7 +623,8 @@ async def extract_basic_info_llm(
         except (TypeError, ValueError):
             clean.pop("age", None)
     if "timezone" in clean:
-        tz = _valid_timezone(str(clean.get("timezone") or ""))
+        # A model must not turn a queried city's zone into the user's own zone.
+        tz = explicit_user_timezone(text)
         if tz:
             clean["timezone"] = tz
         else:
@@ -646,12 +672,9 @@ def extract_basic_info(text: str) -> dict:
     if dislikes:
         info["dislikes"] = list(dict.fromkeys(dislikes))[:6]
 
-    # 只从明确的所在地/时区表达里提取，避免「喜欢东京」被当成时区。
-    if re.search(r"(我在|我住在|我来自|我搬到|搬去|搬来|人在|这边|这里|时间|时区|UTC|GMT)", text, re.I):
-        for hint, tz in _TIMEZONE_HINTS.items():
-            if hint.lower() in text.lower():
-                info["timezone"] = tz
-                break
+    tz = explicit_user_timezone(text)
+    if tz:
+        info["timezone"] = tz
     traits = detect_traits_local(text)
     if traits:
         info["traits"] = traits

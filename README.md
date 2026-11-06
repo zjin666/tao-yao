@@ -5,6 +5,26 @@
 先将 `config.example.json` 复制为 `config.json`，再设置自己的 QQ 号、群号和 API 密钥文件。
 仓库不包含 `private/` 下的密钥、聊天数据、画像数据库、日志和备份；这些文件只保存在本机。
 `models/` 和 `bin/` 为本机下载的模型与工具，也不随源码上传；使用相关功能前需要另行准备。
+`experiments/` 包含本地训练语料、复核记录、依赖及实验权重，不随源码上传。
+
+## 2026-11-06 更新
+
+- 时间查询支持“还记得我这边是几点吗”等私聊问法，以及对时间结果的连续追问。纽约使用 `America/New_York`，自动按日期处理冬夏令时。询问其他城市时间不再覆盖用户自身时区；只有明确的本人所在地或时区声明才更新画像。
+- 用户本人直接向桃夭说“别叫我某某”时，删除自己记录中完整匹配的名字/昵称，保留其他昵称，并记住禁用偏好，避免旧画像抽取重新写回。群聊需明确 @桃夭、回复桃夭或句首称呼桃夭/已登记叫法；对其他群友说话、引用、转述和替别人提出都不执行。此操作不修改 QQ 账号显示名，也不删除用户给桃夭起的名字。
+- 标注记录区分人工确认与助手复核；助手不能覆盖已有人工决定。仅确认个别维度时，默认导出只纳入这些明确确认的维度，避免把其余助手判断混成人工金标。
+
+标注数据保存在本机 `data/annotation_samples/`，不上传 GitHub。常用命令：
+
+```powershell
+python -m taoyao.annotation_cli stats
+python -m taoyao.annotation_cli queue --limit 20
+python -m taoyao.annotation_cli apply 'data/annotation_samples/review/实际文件名.json'
+python -m taoyao.annotation_cli export
+```
+
+复核文件中检查 `text`、`context` 和 `labels`，填写 `reviewer`，将 `decision` 改为 `confirm` 或 `reject`；保留 `pending` 则跳过。导出不自动训练或部署。
+
+本地回归测试：`python -m unittest discover -s test -p 'test_*.py'`。
 
 2026-11-04 表达更新：六维通过直接程度、关心显露、玩笑密度、帮助主动性、理由密度和互动节奏调整语气，不再规定每维的起句动作或多套百分比。语气提示只注入一次；关系和隐私规则保留。日常接话增加“继续互动、减少修饰性复述”的说明和正反示例，保留桃夭的改口与奇妙联想。
 

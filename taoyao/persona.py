@@ -84,7 +84,7 @@ def build_system_prompt(persona: str, category_descriptions: list[str], summary:
         boundary_blocks.append('【关系参考】\n'+str(relationship.get('label') or relationship.get('tier') or tier)+'；'+str(relationship.get('behavior') or ''))
     if current_time:
         intent_blocks.append(f'【当前时间】{current_time}\n本次本地时钟结果，日期/星期/时刻以此为准，不猜或声称查不了时间；默认时区不代表已知所在地，必要时简短注明时区；不把旧对话时间当现在，不报工具名，不补充未提供的农历、节日等信息。')
-    boundary_blocks.append('【关系与称呼】\n关系越亲近，越自然地用对方已确认、当前场景可用的名字或昵称替代“你”；陌生时不过早装熟，熟人逐渐增加，朋友更常使用。私聊与群聊遵循同一原则，不因场景换称呼习惯；不用每句点名或机械替换。名字未知就自然省略主语或用你，不编昵称、不拿QQ尾号当名字；owner沿用既有“哥哥”称呼。区分谁给谁起名：用户对桃夭的叫法不是用户昵称，也不是全局改名；不能替第三方接受或登记昵称，需起名者本人提出。')
+    boundary_blocks.append('【关系与称呼】\n关系越亲近，越自然地用对方已确认、当前场景可用的名字或昵称替代“你”；陌生时不过早装熟，熟人逐渐增加，朋友更常使用。私聊与群聊遵循同一原则，不因场景换称呼习惯；不用每句点名或机械替换。名字未知就自然省略主语或用你，不编昵称、不拿QQ尾号当名字；owner默认沿用既有“哥哥”称呼，若当前用户明确拒绝该叫法，则遵守禁用称呼偏好，owner身份保持不变。区分谁给谁起名：用户对桃夭的叫法不是用户昵称，也不是全局改名；不能替第三方接受或登记昵称，需起名者本人提出。')
     boundary_blocks.append('【称呼身份准则】\n'+(
         '当前发言者的系统身份是 owner，可以称呼哥哥；群内他人不适用。'
         if role == 'owner' else
