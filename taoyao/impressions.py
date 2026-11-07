@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from .personality import TRAIT_LEXICON, merge_traits, normalize_trait
+from .sqlite_tuning import tune
 
 POLICY_VERSION='speaker-traits-v2'
 MAX_TRAITS=8
@@ -43,6 +44,7 @@ class ImpressionStore:
     def connect(self):
         self.path.parent.mkdir(parents=True,exist_ok=True)
         c=sqlite3.connect(self.path);c.row_factory=sqlite3.Row
+        tune(c)
         c.executescript('''
             CREATE TABLE IF NOT EXISTS people (
               user_id TEXT NOT NULL, group_id INTEGER NOT NULL, names TEXT NOT NULL,

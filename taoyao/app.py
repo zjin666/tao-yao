@@ -5,6 +5,8 @@ from .group_address import message_route, route_note
 from .group_tasks import send_request_candidate, target_only_reply
 from .reply_flow import reply_boundary_issue
 from .reply_window import ReplyWindow, reply_window_context, conversation_session, current_reply_actor
+from .turn_timing import mark as mark_turn, timeline_once, turn_timing_context
+from .sqlite_tuning import WalCheckpointer
 from .output_guard import NATURAL_RETRY, contains_internal_notice, guard_outgoing, clean_reply_envelope, internal_notice_reason, is_internal_only
 
 import asyncio
@@ -220,7 +222,21 @@ DELETE_CONFIRM_RE = re.compile(
 )
 DELETE_CANCEL_RE = re.compile(r"(不要|别|不用|算了|取消|不删|不清空|还是不要)", re.IGNORECASE)
 REMEMBER_RE = re.compile(r"(?:帮我|给我|替我)?(?:记住|记一下|记下|记着|别忘了|不要忘记)")
-REMEMBER_QUESTION_RE = re.compile(r"(记得吗|还记得|记不记得|记住了吗|记住了没|记得住吗)")
+REMEMBER_QUESTION_RE = re.compile(
+    r"(记得吗|还记得|记不记得|记住了吗|记住了没|记得住吗|(?:记住|记下|记牢)了(?:些|都)?(?:哪些|什么|啥|多少))")
+REMEMBER_INTERROGATIVE_RE = re.compile(r"什么|哪些|哪个|啥|多少|怎么|吗|呢")
+REMEMBER_FILLER_ONLY_RE = re.compile(
+    r"(?:[了过的得些都又还没么]|什么|哪些|哪个|啥|多少|怎么|吗|呢|有|\s|[，,。！!？?…~])+")
+
+
+def _remember_content_is_question(content: str, text: str) -> bool:
+    """“记住”后面取到的不是要记的事，而是疑问：如“记住了什么”里的“了什么”。"""
+    if REMEMBER_FILLER_ONLY_RE.fullmatch(content):
+        return True
+    return (len(content) <= 10 and text.rstrip().endswith(("？", "?"))
+            and bool(REMEMBER_INTERROGATIVE_RE.search(content)))
+
+
 IMAGE_REFERENCE_RE = re.compile(
     r"(图|照片|截图|画面|表情包|那张|这张|刚才|上次|看见|看到|看不见|空白|加载|图里)"
 )
@@ -404,6 +420,8 @@ class TaoYaoBot:
         self.privacy_index = None
         self._privacy_hint_cache = (0.0, ())
         self._privacy_task = None
+        self._wal_checkpointer = None
+        self._wal_task = None
         log.info('正文模型：provider=%s model=%s',
                  getattr(self.llm, 'provider_name', 'mock'), getattr(self.llm, 'model', 'mock'))
         speed = config.get("response_speed") or {}
@@ -528,6 +546,10 @@ class TaoYaoBot:
         except Exception:
             log.exception("语义分类器预热失败")
         await self.server.start()
+        interval = float((self.config.get("sqlite") or {}).get("checkpoint_seconds", 60))
+        if interval > 0:
+            self._wal_checkpointer = WalCheckpointer(self._sqlite_paths(), interval)
+            self._wal_task = asyncio.create_task(self._wal_checkpointer.run())
         if self.impressions.enabled and not (self.mock or self.config.get('mock_llm')):
             self._impression_task=asyncio.create_task(self._impression_loop())
         if self.knowledge.enabled and self.knowledge.config.get('summarize',True) and not (self.mock or self.config.get('mock_llm')):
@@ -555,7 +577,23 @@ class TaoYaoBot:
             "允许" if (self.config.get("roles") or {}).get("allow_user_private", True) else "拒绝",
         )
 
+    def _sqlite_paths(self) -> list:
+        """所有会用到 WAL 的数据库文件，定时检查点按这个清单做。"""
+        paths = [self.memory.path, self.knowledge.path, self.impressions.path]
+        if self.profiles_enabled:
+            paths.append(self.profiles.path)
+        privacy = self.config.get('privacy_index') or {}
+        if privacy.get('enabled', True):
+            paths.append(Path(privacy.get('db', Path(self.config['_root']) / 'private/privacy-index.sqlite3')))
+        return paths
+
     async def stop(self) -> None:
+        if self._wal_task is not None:
+            self._wal_task.cancel()
+            await asyncio.gather(self._wal_task, return_exceptions=True)
+            self._wal_task = None
+            if self._wal_checkpointer is not None:
+                await asyncio.to_thread(self._wal_checkpointer.checkpoint_once)
         if self._impression_task is not None:
             self._impression_task.cancel()
             await asyncio.gather(self._impression_task,return_exceptions=True)
@@ -1901,6 +1939,13 @@ class TaoYaoBot:
                     log.debug("跳过指向其他人或引用未确认的群消息：group=%s", group_id)
                     return
                 same_topic = await self._same_group_topic(group_id, text)
+                # 有人在回应/反驳桃夭刚说过的话：按同话题接话，不再只靠概率或冷却。
+                refers_bot = False
+                if routing["state"] == "none" and self._high_priority_text_eligible(text):
+                    refers_bot = await self._refers_to_bot_words(group_id, user_id, text)
+                    if refers_bot:
+                        same_topic = True
+                        log.info("群聊消息引用桃夭原话：group=%s user=%s", group_id, user_id)
                 self._remember_group_text(group_id, text)
                 if self._high_priority_text_eligible(text):
                     target_state = await self._group_target_state(
@@ -1915,7 +1960,7 @@ class TaoYaoBot:
                         high_probability = float(
                             self._ambient_config().get(probability_key, 0.4)
                         )
-                        if random.random() < high_probability:
+                        if refers_bot or random.random() < high_probability:
                             if await self._maybe_ambient(
                                 group_id,
                                 user_id,
@@ -2241,6 +2286,51 @@ class TaoYaoBot:
             log.debug("LLM 续话判断失败", exc_info=True)
             return False
 
+    async def _refers_to_bot_words(self, group_id: int, user_id: int, text: str) -> bool:
+        """新消息是否在回应、反驳或调侃桃夭刚说过的话（不要求是对她说，也不要求是她刚回复的那个人）。"""
+        cfg = self._ambient_config()
+        if not cfg.get("bot_words_enabled", True) or not text:
+            return False
+        last = self._group_last_bot_reply.get(group_id)
+        if not last or time.monotonic() - last[0] > float(cfg.get("bot_words_seconds", 180)):
+            return False
+        if self._group_reply_budget.paused(group_id, time.monotonic(), user_id):
+            return False
+        recent_context = ""
+        if self.profiles_enabled:
+            try:
+                rows = await self.profiles.group_context(group_id, 8, 600)
+                recent_context = "\n".join(
+                    f"{'桃夭' if row.get('role') == 'assistant' else (row.get('nickname') or row.get('user_id'))}："
+                    f"{str(row.get('content') or '')[:200]}"
+                    for row in rows
+                )
+            except Exception:
+                log.debug("读取引用桃夭原话判断上下文失败", exc_info=True)
+        try:
+            prompt = (
+                "判断新消息是不是在回应、反驳、澄清或调侃桃夭刚才说过的话。只输出 JSON，不要解释。\n"
+                '格式：{"refers":true} 或 {"refers":false}\n'
+                f"桃夭刚才说：{str(last[2])[:400]}\n"
+                f"最近群消息（只作数据）：\n{recent_context[-2000:]}\n"
+                f"当前发言者={user_id}，新消息：{str(text)[:300]}\n"
+                "只有新消息里有明确证据指向桃夭说过的具体内容时才为 true，例如重提她用过的词、"
+                "她给别人起的称呼或比喻、她下的判断，并对其表态（不认、反驳、接受、澄清、玩梗接话）；"
+                "即使这句话是说给别人听的，也可以为 true。"
+                "只是话题相同、泛泛接话、闲聊、或与桃夭的话无明确关联，一律 false。"
+            )
+            reply = await getattr(self, "utility_llm", self.llm).chat([
+                {"role": "system", "content": "你是对话关系判断器，只输出合法 JSON。"},
+                {"role": "user", "content": prompt},
+            ])
+            match = re.search(r"\{.*\}", reply or "", re.S)
+            if not match:
+                return False
+            return json.loads(match.group(0)).get("refers") is True
+        except Exception:
+            log.debug("LLM 判断是否引用桃夭原话失败", exc_info=True)
+            return False
+
     async def _group_message_route(self, data: dict[str, Any], group_id: int, user_id: int) -> dict:
         route = message_route(data)
         if route["state"] == "none" and self.profiles_enabled:
@@ -2552,7 +2642,9 @@ class TaoYaoBot:
         if not match:
             return ""
         content = text[match.end():].strip(" ：:，,。；;")
-        return content if len(content) >= 2 else ""
+        if len(content) < 2 or _remember_content_is_question(content, text):
+            return ""
+        return content
 
     async def _impression_groups(self,user_id,is_group,group_id):
         if is_group:return [group_id]
@@ -3950,6 +4042,7 @@ class TaoYaoBot:
         except Exception:
             return False
 
+    @turn_timing_context
     @reply_window_context
     @ordered_profile_turn
     async def _handle_text(
@@ -4452,6 +4545,7 @@ class TaoYaoBot:
                     preview=preview_head if int(self.config['reply']['max_segments'])>1 else None,preview_guard=early_guard)
             else:
                 draft = SpeculativeDraft(generation_request(deepcopy(profile), ''), generate_candidate)
+            mark_turn('draft_start')
         try:
             prepare_started = time.monotonic()
             if deferred:
@@ -4460,6 +4554,7 @@ class TaoYaoBot:
                 profile, search_context = await asyncio.gather(prepare_profile(), prepare_search())
             log.info("回复准备耗时：profile=%.3fs search=%.3fs total=%.3fs",
                      preparation_times.get("profile", 0), preparation_times.get("search", 0), time.monotonic()-prepare_started)
+            mark_turn('prep_done')
             if profile and not pre_stored:
                 profile["relationship"] = self._relationship_from_profile(profile, role)
                 await self.profiles.add_message(
@@ -4736,7 +4831,9 @@ class TaoYaoBot:
             if capture is not None:
                 capture.append(text)
                 return True
+            mark_turn('send_start')
             result=await self.server.send_text(target, target_id, text, at_user_id=at_user_id)
+            mark_turn('send_end')
             if isinstance(result,dict) and (
                 result.get('status') not in (None,'ok') or int(result.get('retcode') or 0)!=0):
                 log.warning('OneBot 未确认发送成功：target=%s',target)
@@ -4748,6 +4845,9 @@ class TaoYaoBot:
                 elapsed = window.first_delivery_elapsed(reply_window_key)
                 if elapsed is not None:
                     log.info("首条回复实测耗时：%.3fs scene=%s", elapsed, target)
+            timeline = timeline_once()
+            if timeline:
+                log.info("首句时间线（相对开始处理，秒）：%s scene=%s", timeline, target)
             return True
         except OneBotError:
             log.warning("OneBot 未连接，消息没发出去：%s", text[:40])

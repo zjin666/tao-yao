@@ -10,6 +10,7 @@ from typing import Any
 
 from .personality import merge_traits, is_tao_nickname_fragment
 from .name_preferences import remove_disallowed_names
+from .sqlite_tuning import tune
 
 DEFAULT_SCORES = {"AGG": 50.0, "INT": 50.0, "HUM": 50.0, "DEP": 50.0, "RAT": 50.0, "ACT": 50.0}
 
@@ -26,6 +27,7 @@ class ProfileStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        tune(self._conn)
         self._lock = asyncio.Lock()
         self._init_schema()
 
@@ -748,8 +750,8 @@ class ProfileStore:
             rows = kept[-int(limit):]
         return rows
 
-    async def group_context(self, group_id: int, limit: int = 16) -> list[dict]:
-        return await self._run(self._group_context, int(group_id or 0), int(limit))
+    async def group_context(self, group_id: int, limit: int = 16, max_age_seconds: int = 0) -> list[dict]:
+        return await self._run(self._group_context, int(group_id or 0), int(limit), int(max_age_seconds))
 
     def _reply_inputs(self, user_id: str, scene: str, group_id: int, limit: int,
                       include_private: bool, include_user_memory: bool,

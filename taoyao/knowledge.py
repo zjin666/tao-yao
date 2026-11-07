@@ -10,15 +10,16 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from .sqlite_tuning import tune
 
 
 TEACH_RE = re.compile(r'记为(?:公开)?知识|(?:学习|学会|学一下|学一学|学着|教你|记住|记一下|记下|记着)|纠正|更正|说错|错了|不对|应该是|不是.{0,50}而是')
 PUBLIC_RE = re.compile(r'^\s*(?:桃夭[，,:：\s]*)?(?:请|帮我)?\s*记为公开知识[：:\s，,]*')
-INVENTORY_RE = re.compile(r'(?:学到|学会|学习了|学了).{0,10}(?:哪些|什么|啥|多少)|(?:有|新增了?).{0,6}(?:哪些|什么).{0,4}(?:知识|学到的)|知识库.{0,12}(?:有哪些|有什么|多少|内容|记录)')
+INVENTORY_RE = re.compile(r'(?:学到|学会|学习了|学了).{0,10}(?:哪些|什么|啥|多少)|(?:记住|记下|记牢)了(?:些|都)?(?:哪些|什么|啥|多少)|(?:有|新增了?).{0,6}(?:哪些|什么).{0,4}(?:知识|学到的)|知识库.{0,12}(?:有哪些|有什么|多少|内容|记录)')
 
 
 def knowledge_inventory_question(text):
-    if re.search(r'(?:我|他|她|他们|她们)(?:目前|最近|现在|已经|刚才|刚刚)?(?:有)?(?:学到|学会|学了)',text or ''):
+    if re.search(r'(?:我|他|她|他们|她们)(?:目前|最近|现在|已经|刚才|刚刚)?(?:有)?(?:学到|学会|学了|记住|记下|记牢)',text or ''):
         return False
     return bool(INVENTORY_RE.search(text or '')) and not re.search(r'不要告诉|不用告诉|别告诉',text or '')
 
@@ -56,6 +57,7 @@ class KnowledgeStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
+        tune(conn)
         conn.executescript('''
             CREATE TABLE IF NOT EXISTS knowledge (
                 id INTEGER PRIMARY KEY, topic TEXT NOT NULL, content TEXT NOT NULL,

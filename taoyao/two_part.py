@@ -9,6 +9,7 @@ import time
 from .output_guard import internal_notice_reason,is_internal_only
 from .reply_flow import reply_boundary_issue
 from .review_prompts import REVIEW_PROMPT
+from .turn_timing import mark
 log=logging.getLogger(__name__)
 
 
@@ -73,10 +74,12 @@ class ScopedReplyGuard:
             key=self.key(sent,pending)
             if self.ticket==key:
                 reason='';return reason
+            mark('check_start')
             result=await self.llm.chat([
                 {'role':'system','content':REVIEW_PROMPT},
                 {'role':'user','content':json.dumps({'policy':self.policy,'current':self.current,
                     'already_sent':sent,'pending':pending,'protected':[f['text'] for f in self.hints]},ensure_ascii=False,separators=(',',':'))}])
+            mark('check_end')
             verdict=json.loads(result.strip())
             if verdict.get('allowed') is True:
                 self.ticket=key;reason='';return reason

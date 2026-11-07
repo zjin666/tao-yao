@@ -5,6 +5,8 @@ import json
 import logging
 import time
 
+from .turn_timing import mark
+
 log = logging.getLogger(__name__)
 
 
@@ -52,11 +54,13 @@ class StreamingDraft:
             started=time.monotonic();complete=False;buffer=''
             try:
                 async for chunk in stream(snapshot['messages']):
+                    mark('first_token')
                     if preview is not None and self.preview_task is None:
                         from .two_part import first_sentence
                         import re
                         buffer+=chunk
                         part,_=first_sentence(buffer)
+                        if part is not None:mark('first_sentence')
                         if part is not None and not re.fullmatch(r'[A-Za-z0-9\s.,:;!?。！？-]{1,16}',part.strip()):
                             self.preview_task=asyncio.create_task(preview(part))
                     await self.queue.put(('text',chunk))

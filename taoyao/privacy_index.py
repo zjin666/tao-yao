@@ -14,6 +14,7 @@ import sqlite3
 import threading
 import unicodedata
 import uuid
+from .sqlite_tuning import tune
 
 
 KINDS = {'identity','contact','location','health','finance','credential','relationship','plan','other_private'}
@@ -26,6 +27,7 @@ def canonical(text):
 def install_revision_counter(path,kind):
     """Tiny source-local revision; unrelated group messages/score changes don't invalidate privacy."""
     db=sqlite3.connect(str(path),timeout=15)
+    tune(db,wal=False)  # 源库的日志模式由各自的存储类管理，这里只放宽同步。
     try:
         with db:
             db.execute('CREATE TABLE IF NOT EXISTS _privacy_index_revision '
@@ -87,6 +89,7 @@ class PrivacyIndex:
                         [('profile',profile_db),('memory',memory_db)]}
         self.db = sqlite3.connect(str(self.path),check_same_thread=False,timeout=15)
         self.db.row_factory = sqlite3.Row
+        tune(self.db)
         self.db.execute('PRAGMA foreign_keys=ON')
         self.db.execute('PRAGMA secure_delete=ON')
         with self.db:

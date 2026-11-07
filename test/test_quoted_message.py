@@ -29,6 +29,7 @@ class QuotedMessageTests(unittest.IsolatedAsyncioTestCase):
             bot.server.call.assert_not_awaited()
             self.assertIsNone(await history.find_message('private',200,'other'))
             self.assertIsNone(await history.find_message('group',200,'quoted'))
+            await history.flush()  # Windows cannot delete the temp dir while the background fsync holds the file.
 
     async def test_api_scope_cache_and_local_absence(self):
         bot=TaoYaoBot.__new__(TaoYaoBot);bot.profiles_enabled=False

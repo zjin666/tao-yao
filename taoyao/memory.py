@@ -5,6 +5,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from .sqlite_tuning import tune
 
 
 def _now() -> str:
@@ -17,6 +18,7 @@ class MemoryStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        tune(self._conn)
         self._lock = asyncio.Lock()
         self._summary_epochs: dict[str,int] = {}
         self._init_schema()
