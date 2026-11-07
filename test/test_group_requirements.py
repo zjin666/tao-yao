@@ -28,6 +28,11 @@ class PureFunctionTests(unittest.TestCase):
         self.assertTrue(entrust_candidate('监督的任务就交给你了，我亲爱的妹妹'))
         self.assertTrue(entrust_candidate('下次守夜再熬夜你提醒他一下'))
         self.assertFalse(entrust_candidate('今天天气真好'))
+        self.assertFalse(entrust_candidate('这是晚安之后的配图'))     # a bare “之后” is not enough
+        self.assertFalse(entrust_candidate('吃完饭之后我去睡觉'))
+        self.assertTrue(entrust_candidate('之后你要提醒守夜早点睡'))   # “之后” followed by a request is
+        self.assertTrue(entrust_candidate('晚点之后，记得提醒他'))
+        self.assertTrue(entrust_candidate('你应该多看着点守夜'))       # “你应该” still goes to the model
         self.assertFalse(entrust_candidate('/群要求 以后别刷屏'))
         self.assertFalse(entrust_candidate(''))
         self.assertFalse(entrust_candidate('他说“以后你要监督我”'))  # quoted words are data
