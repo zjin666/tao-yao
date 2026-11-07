@@ -4283,6 +4283,12 @@ class TaoYaoBot:
                 include_analysis=bool(profile) and not pre_stored and getattr(self, "analysis_pipeline", None) is not None,
                 analysis_limit=int((self.config.get("language_analysis") or {}).get("context_messages", 6)),
                 message_id=message_id,
+                # 群聊回复只带近期消息，太早的话题（含旧图片描述）不再续接。
+                group_max_age_seconds=int(float((self.config.get("reply") or {}).get(
+                    "group_history_minutes", 60)) * 60) if is_group else 0,
+                # 更早的记录只保留桃夭实际回复过的那段，最远回溯这么久。
+                group_recall_seconds=int(float((self.config.get("reply") or {}).get(
+                    "group_recall_hours", 24)) * 3600) if is_group else 0,
             )
             history = reply_inputs["history"]
         else:
