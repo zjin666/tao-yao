@@ -3,6 +3,9 @@ from __future__ import annotations
 from .group_budget import GroupReplyBudget
 from .group_address import message_route, route_note
 from .group_tasks import send_request_candidate, target_only_reply
+from .group_requirements import (GLOBAL_LIMIT as GROUP_REQUIREMENT_GLOBAL_LIMIT, KIND_LABEL, KIND_ONE_TIME,
+    KIND_STANDING, PENDING_SECONDS, completion_messages, confirm_messages, entrust_candidate,
+    extract_messages, limit_from_member_count, parse_completion, parse_confirmation, parse_extraction)
 from .reply_flow import reply_boundary_issue
 from .reply_window import ReplyWindow, reply_window_context, conversation_session, current_reply_actor
 from .turn_timing import mark as mark_turn, timeline_once, turn_timing_context
@@ -422,6 +425,7 @@ class TaoYaoBot:
         self._privacy_task = None
         self._wal_checkpointer = None
         self._wal_task = None
+        self._requirement_asked_id: dict[str, int] = {}
         log.info('正文模型：provider=%s model=%s',
                  getattr(self.llm, 'provider_name', 'mock'), getattr(self.llm, 'model', 'mock'))
         speed = config.get("response_speed") or {}
@@ -3218,6 +3222,157 @@ class TaoYaoBot:
             log.debug("判断跨群任务失败", exc_info=True)
             return None
 
+    async def _group_requirement_limit(self, group_id: int) -> int:
+        """每个群的公共要求条数上限 = 群成员数 - 2（至少 1）；“所有群”用 global_max。"""
+        cfg = self.config.get("group_requirements") or {}
+        if not group_id:
+            return max(1, int(cfg.get("global_max", GROUP_REQUIREMENT_GLOBAL_LIMIT)))
+        cache = getattr(self, "_group_member_counts", None)
+        if cache is None:
+            cache = self._group_member_counts = {}
+        now = time.monotonic()
+        cached = cache.get(int(group_id))
+        count = cached[0] if cached and now - cached[1] < 600 else None
+        if count is None:
+            try:
+                result = await self.server.call(
+                    "get_group_info", {"group_id": int(group_id), "no_cache": False}, timeout=5)
+                data = result.get("data") if self._onebot_ok(result) else None
+                fetched = data.get("member_count") if isinstance(data, dict) else None
+                if isinstance(fetched, int) and not isinstance(fetched, bool) and fetched > 0:
+                    cache[int(group_id)] = (fetched, now)
+                    count = fetched
+            except Exception:
+                log.debug("读取群人数失败", exc_info=True)
+            if count is None and cached:
+                count = cached[0]
+        return limit_from_member_count(count, int(cfg.get("fallback_limit", 3)))
+
+    async def _requirement_target_group(self, is_group: bool, group_id: int, mention: str) -> int:
+        """嘱托要写进哪个群：群里说的就是当前群；私聊必须能唯一确定，否则返回 0。"""
+        if is_group:
+            return int(group_id)
+        if mention:
+            groups = await self._select_group_targets(mention)
+        else:
+            groups = await self._group_list()
+        return int(groups[0]["group_id"]) if len(groups) == 1 else 0
+
+    @staticmethod
+    def _requirement_lines(items: list[dict]) -> str:
+        return "；".join(f"[{item['id']}]（{KIND_LABEL.get(item['kind'], '长期')}）{item['content']}" for item in items)
+
+    async def _group_requirement_request(self, text, role, user_id, is_group, group_id, message_id, ambient=False) -> str:
+        """owner 对“以后/将来在群里怎么做”的嘱托：先复述并等 owner 确认，确认后才写进群公共要求。"""
+        cfg = self.config.get("group_requirements") or {}
+        if not cfg.get("enabled", True) or ambient or not self.profiles_enabled:
+            return ""
+        if role != "owner" or user_id != self._owner_qq() or not text or text.lstrip().startswith(("/", "群要求")):
+            return ""
+        if is_group:
+            route = getattr(self, "_group_routes", {}).get((group_id, message_id), {})
+            if route.get("state") != "bot":
+                return ""
+        owner = str(user_id)
+        llm = getattr(self, "utility_llm", self.llm)
+        pending = await self.profiles.pending_group_requirement(owner, PENDING_SECONDS)
+        if pending:
+            decision = "other"
+            try:
+                decision = parse_confirmation(await llm.chat(confirm_messages(text, pending)), text)
+            except Exception:
+                log.debug("判断群要求确认失败", exc_info=True)
+            if decision == "confirm":
+                try:
+                    limit = await self._group_requirement_limit(pending["group_id"])
+                    outcome = await self.profiles.confirm_group_requirement(pending["id"], limit)
+                except Exception:
+                    log.exception("群公共要求写入失败")
+                    return "这次群公共要求没有写进去，不要说已经保存；自然说明稍后再试。"
+                if outcome == "ok":
+                    count = await self.profiles.count_group_requirements(pending["group_id"])
+                    log.info("群公共要求已生效：group=%s id=%s kind=%s", pending["group_id"], pending["id"], pending["kind"])
+                    return (
+                        f"主人确认了，你刚把这条写进了群 {pending['group_id']} 的公共要求（"
+                        f"{KIND_LABEL.get(pending['kind'], '长期')}，现在第 {count}/{limit} 条）：{pending['content']}。"
+                        "用桃夭口吻简短确认；一次性要求要说明做完会自动删掉，不要说现在就去做。")
+                await self.profiles.clear_pending_group_requirements(owner)
+                if outcome == "full":
+                    items = await self.profiles.list_group_requirements(pending["group_id"])
+                    return (
+                        f"群 {pending['group_id']} 的公共要求已满（最多 {limit} 条，等于群人数减 2），"
+                        f"现有：{self._requirement_lines(items)}。刚才那条没有保存。"
+                        "用桃夭口吻说明满了，让主人先发“/群要求 删除 编号”删一条，或等一次性要求完成。")
+                return "刚才待确认的群公共要求已经失效，没有保存；自然说明，让主人需要的话重新说一次。"
+            await self.profiles.clear_pending_group_requirements(owner)
+            if decision == "cancel":
+                return "主人取消了刚才那条群公共要求，没有保存任何内容。用桃夭口吻简短接住，不追问。"
+        if not entrust_candidate(text):
+            return ""
+        try:
+            proposal = parse_extraction(await llm.chat(extract_messages(text)), text)
+        except Exception:
+            log.debug("判断群公共要求嘱托失败", exc_info=True)
+            return ""
+        if not proposal:
+            return ""
+        target_group = await self._requirement_target_group(is_group, group_id, proposal["group"])
+        if not target_group:
+            return ("主人嘱托了一件以后在群里要做的事，但没说清是哪个群，还没有保存。"
+                    "用桃夭口吻问是哪个群（说群号或群名）。")
+        limit = await self._group_requirement_limit(target_group)
+        items = await self.profiles.list_group_requirements(target_group)
+        if len(items) >= limit:
+            return (
+                f"主人想给群 {target_group} 加一条公共要求，但已满（最多 {limit} 条，等于群人数减 2），"
+                f"现有：{self._requirement_lines(items)}。没有保存。"
+                "用桃夭口吻说明满了，让主人先发“/群要求 删除 编号”删一条，或等一次性要求完成。")
+        await self.profiles.clear_pending_group_requirements(owner)
+        item_id = await self.profiles.add_group_requirement(
+            target_group, proposal["content"], proposal["kind"], "pending", owner)
+        # 问题真正发出去之后才会标记为已询问，之前它不能被确认。
+        if getattr(self, "_requirement_asked_id", None) is None:
+            self._requirement_asked_id = {}
+        self._requirement_asked_id[owner] = item_id
+        kind = KIND_LABEL[proposal["kind"]]
+        tail = "做完这一次就会自动删掉" if proposal["kind"] == KIND_ONE_TIME else "之后一直照着做"
+        return (
+            f"主人刚嘱托你一件事：{proposal['content']}（{kind}，群 {target_group}，不需要现在就做）。"
+            f"这还没有保存。用桃夭口吻简短复述你的理解，说明是{kind}要求、{tail}，"
+            "再问主人要不要写进这个群的公共要求；不要声称已经写入或记住，等主人明确说好才会保存。")
+
+    def _schedule_requirement_completion(self, group_id: int, reply: str, trigger: str) -> None:
+        """桃夭在群里发完话后，后台判断有没有顺手完成某条一次性要求；不阻塞正常回复。"""
+        if not getattr(self, "profiles_enabled", False) or not reply:
+            return
+        task = asyncio.create_task(
+            self._complete_one_time_requirements(group_id, reply, trigger), context=Context())
+        self._memory_tasks.add(task)
+        task.add_done_callback(self._memory_tasks.discard)
+
+    async def _complete_one_time_requirements(self, group_id: int, reply: str, trigger: str) -> None:
+        try:
+            items = [i for i in await self.profiles.list_group_requirements(group_id)
+                     if i["kind"] == KIND_ONE_TIME]
+            if not items:
+                return
+            context = ""
+            try:
+                rows = await self.profiles.group_context(group_id, 4, 600)
+                context = "\n".join(f"{row.get('nickname') or row.get('role')}：{str(row.get('content') or '')[:150]}"
+                                    for row in rows)
+            except Exception:
+                log.debug("读取一次性要求完成判断上下文失败", exc_info=True)
+            llm = getattr(self, "utility_llm", self.llm)
+            for item in items:
+                raw = await llm.chat(completion_messages(item, f"{context}\n{trigger}".strip(), reply))
+                if parse_completion(raw, reply) and await self.profiles.delete_group_requirement(item["id"], group_id):
+                    log.info("一次性群要求已完成并删除：group=%s id=%s", group_id, item["id"])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("判断一次性群要求是否完成失败", exc_info=True)
+
     async def _handle_owner_group_task(
         self, target: str, target_id: int, user_id: int, text: str, profile: dict | None
     ) -> bool:
@@ -4129,6 +4284,12 @@ class TaoYaoBot:
                 target, target_id, user_id, command, profile
             ):
                 return
+        requirement_asked = None
+        if not feature_intent:
+            feature_intent = await self._group_requirement_request(
+                raw_text if raw_text is not None else text, role, user_id, is_group, group_id,
+                message_id, ambient=ambient)
+            requirement_asked = getattr(self, "_requirement_asked_id", {}).pop(str(user_id), None)
         memory_text = "" if feature_intent or command.startswith("/") or reported_nickname else self._memory_request_text(text)
         if memory_text and profile:
             self._schedule_memory_update(
@@ -4206,21 +4367,44 @@ class TaoYaoBot:
                 if len(parts) == 2 and parts[0].isdigit():
                     target_group = int(parts[0])
                     content = parts[1].strip()
+            scope = f"群 {target_group}" if target_group else "所有群"
+            limit = await self._group_requirement_limit(target_group)
             if not content:
-                requirements = await self.profiles.get_group_requirements(target_group)
-                scope = f"群 {target_group}" if target_group else "所有群"
-                text = f"{scope}的公共要求：\n" + ("\n".join(f"- {x}" for x in requirements) if requirements else "暂无")
+                items = await self.profiles.list_group_requirements(target_group)
+                text = f"{scope}的公共要求（{len(items)}/{limit}）：\n" + (
+                    "\n".join(f"[{x['id']}]（{KIND_LABEL.get(x['kind'], '长期')}）{x['content']}" for x in items)
+                    if items else "暂无")
                 await self._send_segments(target, target_id, text, profile=profile)
+                return
+            removal = re.fullmatch(r"(?:删除|删掉|删)\s*(\d+)", content)
+            if removal:
+                removed = await self.profiles.delete_group_requirement(int(removal[1]), target_group)
+                await self._send_segments(
+                    target, target_id,
+                    f"{scope}的公共要求 {removal[1]} 已删除。" if removed else f"{scope}里没有编号 {removal[1]} 的公共要求。",
+                    profile=profile)
+                return
+            kind = KIND_STANDING
+            marked = re.match(r"(一次性|一次|长期)\s*[：:]?\s*(.+)", content, re.S)
+            if marked:
+                kind = KIND_ONE_TIME if marked[1] in ("一次性", "一次") else KIND_STANDING
+                content = marked[2].strip()
+            if kind == KIND_ONE_TIME and not target_group:
+                await self._send_segments(
+                    target, target_id, "一次性要求要指定具体的群：/群要求 群号 一次性 内容。", profile=profile)
                 return
             if len(content) > 500:
                 await self._send_segments(target, target_id, "公共要求太长了，控制在 500 字以内。", profile=profile)
                 return
-            await self.profiles.set_group_requirement(target_group, content)
+            if await self.profiles.count_group_requirements(target_group) >= limit:
+                await self._send_segments(
+                    target, target_id,
+                    f"{scope}的公共要求已满（最多 {limit} 条），先用 /群要求 删除 编号 删一条。", profile=profile)
+                return
+            await self.profiles.add_group_requirement(target_group, content, kind, "active", str(user_id))
             await self._send_segments(
                 target, target_id,
-                "公共要求已更新。" if target_group == 0 else f"群 {target_group} 的公共要求已更新。",
-                profile=profile,
-            )
+                f"{scope}的公共要求已添加（{KIND_LABEL[kind]}）。", profile=profile)
             return
         if command.startswith("/签名") or command.startswith("签名 "):
             if is_group:
@@ -4246,7 +4430,7 @@ class TaoYaoBot:
             return
         if command in ("/帮助", "帮助"):
             if role == "owner":
-                text = "能用的：/reset 清空对话、/记住 内容、/表情 分类、/画像 [QQ]、/时区、/群要求 内容、/发空间 内容、/空间、/签名 内容、/状态、/删除我的数据、/帮助；也可以直接说「删掉关于我的记忆」，我会先确认。"
+                text = "能用的：/reset 清空对话、/记住 内容、/表情 分类、/画像 [QQ]、/时区、/群要求 [一次性|删除 编号] 内容、/发空间 内容、/空间、/签名 内容、/状态、/删除我的数据、/帮助；也可以直接说「删掉关于我的记忆」，我会先确认。"
             else:
                 text = "能用的：/表情 分类、/画像、/时区、/删除我的数据、/帮助；也可以直接说「删掉关于我的记忆」，我会先确认。"
             await self._send_segments(target, target_id, text)
@@ -4615,6 +4799,10 @@ class TaoYaoBot:
                     await self._bump_relationship(user_id, is_group, not ambient)
                 if is_group and not departing:
                     self._group_last_bot_reply[group_id] = (time.monotonic(), user_id, reply, text)
+                if is_group:
+                    self._schedule_requirement_completion(group_id, reply, text)
+                if requirement_asked:
+                    await self.profiles.mark_group_requirement_asked(requirement_asked)
                 await self.memory.add_message(session, "assistant", reply)
                 if profile:
                     await self.profiles.add_message(user_id, scene, group_id, "assistant", reply,

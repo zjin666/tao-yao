@@ -133,8 +133,31 @@ class ProfileStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_group_topic_memory_group
                     ON group_topic_memory(group_id, id);
+                CREATE TABLE IF NOT EXISTS group_requirement_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_id INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'standing',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_by TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    confirmed_at TEXT NOT NULL DEFAULT '',
+                    asked INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_group_requirement_items_group
+                    ON group_requirement_items(group_id, status, id);
                 """
             )
+            item_cols = [row[1] for row in self._conn.execute("PRAGMA table_info(group_requirement_items)").fetchall()]
+            if "asked" not in item_cols:
+                self._conn.execute("ALTER TABLE group_requirement_items ADD COLUMN asked INTEGER NOT NULL DEFAULT 0")
+            # 旧版每个群只有一条要求：一次性搬进新表（长期、已生效），搬完清空旧表，不会重复搬。
+            self._conn.execute(
+                "INSERT INTO group_requirement_items(group_id, content, kind, status, created_at, confirmed_at) "
+                "SELECT group_id, content, 'standing', 'active', updated_at, updated_at "
+                "FROM group_requirements WHERE TRIM(content) != ''"
+            )
+            self._conn.execute("DELETE FROM group_requirements")
             # 兼容旧库：已有 profiles 表没有 role 字段时补上。
             cols = [row[1] for row in self._conn.execute("PRAGMA table_info(profiles)").fetchall()]
             if "role" not in cols:
@@ -972,27 +995,142 @@ class ProfileStore:
         await self._run(self._add_group_topic, int(group_id), topic)
 
     def _get_group_requirements(self, group_id: int) -> list[str]:
+        """写进提示词的要求（已生效的），“所有群”(0) 在前，一次性要求带说明。"""
+        from .group_requirements import format_for_prompt
         rows = self._conn.execute(
-            "SELECT content FROM group_requirements WHERE group_id IN (0, ?) "
-            "ORDER BY group_id ASC",
+            "SELECT content, kind FROM group_requirement_items "
+            "WHERE group_id IN (0, ?) AND status = 'active' ORDER BY group_id ASC, id ASC",
             (int(group_id),),
         ).fetchall()
-        return [str(row["content"]).strip() for row in rows if str(row["content"]).strip()]
+        return [text for text in (format_for_prompt(dict(row)) for row in rows) if text.strip()]
 
     def _set_group_requirement(self, group_id: int, content: str) -> None:
+        """兼容旧接口：用一条长期要求替换该群全部已生效的长期要求；空内容就是清空。"""
+        content = str(content or "").strip()
         with self._conn:
             self._conn.execute(
-                "INSERT INTO group_requirements(group_id, content, updated_at) VALUES (?, ?, ?) "
-                "ON CONFLICT(group_id) DO UPDATE SET content = excluded.content, "
-                "updated_at = excluded.updated_at",
-                (int(group_id), str(content or "").strip(), _now()),
+                "DELETE FROM group_requirement_items WHERE group_id = ? AND status = 'active' AND kind = 'standing'",
+                (int(group_id),),
             )
+            if content:
+                now = _now()
+                self._conn.execute(
+                    "INSERT INTO group_requirement_items(group_id, content, kind, status, created_at, confirmed_at) "
+                    "VALUES (?, ?, 'standing', 'active', ?, ?)",
+                    (int(group_id), content, now, now),
+                )
+
+    def _add_group_requirement(self, group_id: int, content: str, kind: str, status: str, created_by: str) -> int:
+        now = _now()
+        with self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO group_requirement_items(group_id, content, kind, status, created_by, created_at, confirmed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (int(group_id), str(content).strip(), kind, status, str(created_by or ""), now,
+                 now if status == "active" else ""),
+            )
+            return int(cur.lastrowid)
+
+    def _list_group_requirements(self, group_id: int, status: str = "active") -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT id, group_id, content, kind, status, created_by, created_at FROM group_requirement_items "
+            "WHERE group_id = ? AND status = ? ORDER BY id ASC",
+            (int(group_id), status),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _count_group_requirements(self, group_id: int) -> int:
+        return int(self._conn.execute(
+            "SELECT COUNT(*) FROM group_requirement_items WHERE group_id = ? AND status = 'active'",
+            (int(group_id),),
+        ).fetchone()[0])
+
+    def _confirm_group_requirement(self, item_id: int, limit: int) -> str:
+        """待确认 -> 已生效。返回 ok / full / missing，条数在写入这一刻再核一次。"""
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT group_id FROM group_requirement_items WHERE id = ? AND status = 'pending'",
+                (int(item_id),),
+            ).fetchone()
+            if row is None:
+                return "missing"
+            active = self._conn.execute(
+                "SELECT COUNT(*) FROM group_requirement_items WHERE group_id = ? AND status = 'active'",
+                (int(row["group_id"]),),
+            ).fetchone()[0]
+            if active >= int(limit):
+                return "full"
+            self._conn.execute(
+                "UPDATE group_requirement_items SET status = 'active', confirmed_at = ? WHERE id = ?",
+                (_now(), int(item_id)),
+            )
+            return "ok"
+
+    def _delete_group_requirement(self, item_id: int, group_id: int | None = None) -> bool:
+        sql, args = "DELETE FROM group_requirement_items WHERE id = ?", [int(item_id)]
+        if group_id is not None:
+            sql, args = sql + " AND group_id = ?", args + [int(group_id)]
+        with self._conn:
+            return self._conn.execute(sql, args).rowcount > 0
+
+    def _pending_group_requirement(self, created_by: str, max_age_seconds: int) -> dict | None:
+        """该 owner 最新的待确认要求；超时的顺手作废。"""
+        cutoff = datetime.fromtimestamp(
+            datetime.now(timezone.utc).timestamp() - int(max_age_seconds), timezone.utc
+        ).isoformat(timespec="seconds")
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM group_requirement_items WHERE status = 'pending' AND created_at < ?", (cutoff,))
+        row = self._conn.execute(
+            "SELECT id, group_id, content, kind, status, created_by, created_at FROM group_requirement_items "
+            "WHERE status = 'pending' AND asked = 1 AND created_by = ? ORDER BY id DESC LIMIT 1",
+            (str(created_by),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def _mark_group_requirement_asked(self, item_id: int) -> bool:
+        """桃夭确实把确认问题发出去之后才算“已询问”；没发出去的待确认内容不能被确认。"""
+        with self._conn:
+            return self._conn.execute(
+                "UPDATE group_requirement_items SET asked = 1 WHERE id = ? AND status = 'pending'",
+                (int(item_id),)).rowcount > 0
+
+    def _clear_pending_group_requirements(self, created_by: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM group_requirement_items WHERE status = 'pending' AND created_by = ?",
+                (str(created_by),))
 
     async def get_group_requirements(self, group_id: int) -> list[str]:
         return await self._run(self._get_group_requirements, int(group_id))
 
     async def set_group_requirement(self, group_id: int, content: str) -> None:
         await self._run(self._set_group_requirement, int(group_id), content)
+
+    async def add_group_requirement(self, group_id: int, content: str, kind: str = "standing",
+                                    status: str = "active", created_by: str = "") -> int:
+        return await self._run(self._add_group_requirement, int(group_id), content, kind, status, created_by)
+
+    async def list_group_requirements(self, group_id: int, status: str = "active") -> list[dict]:
+        return await self._run(self._list_group_requirements, int(group_id), status)
+
+    async def count_group_requirements(self, group_id: int) -> int:
+        return await self._run(self._count_group_requirements, int(group_id))
+
+    async def confirm_group_requirement(self, item_id: int, limit: int) -> str:
+        return await self._run(self._confirm_group_requirement, int(item_id), int(limit))
+
+    async def delete_group_requirement(self, item_id: int, group_id: int | None = None) -> bool:
+        return await self._run(self._delete_group_requirement, int(item_id), group_id)
+
+    async def pending_group_requirement(self, created_by: str, max_age_seconds: int = 600) -> dict | None:
+        return await self._run(self._pending_group_requirement, str(created_by), int(max_age_seconds))
+
+    async def mark_group_requirement_asked(self, item_id: int) -> bool:
+        return await self._run(self._mark_group_requirement_asked, int(item_id))
+
+    async def clear_pending_group_requirements(self, created_by: str) -> None:
+        await self._run(self._clear_pending_group_requirements, str(created_by))
 
     def _add_group_task(self, user_id: str, instruction: str, target_group: int) -> int:
         with self._conn:
