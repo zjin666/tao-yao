@@ -49,7 +49,7 @@ class TwoPartProductionTests(unittest.IsolatedAsyncioTestCase):
         async def send(*args,**kwargs):release.set()
         bot.server.send_text.side_effect=send
         result=await asyncio.wait_for(self.call(bot),2)
-        self.assertEqual(result[0],'我在听\n慢慢说。别着急')
+        self.assertEqual(result[0],'我在听\n慢慢说，别着急')
         self.assertEqual(bot.server.send_text.await_count,2)
         self.assertEqual(bot.utility_llm.chat.await_count,2)
 

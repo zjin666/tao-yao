@@ -20,7 +20,6 @@ class DetachedMemeTests(unittest.IsolatedAsyncioTestCase):
             cfg['privacy_index']['enabled']=False;cfg['intro']['enabled']=False
             cfg['user_memes']['enabled']=False;cfg['memes']['enabled']=True
             cfg['response_speed'].update(speculative_reply=True,two_part_reply=True,defer_six_axis=False)
-            cfg['roles']['user_max_segments']=4
             cfg['reply'].update(segment_gap_min_seconds=0,segment_gap_max_seconds=0)
             bot=TaoYaoBot(cfg,mock=True)
             first_sent=asyncio.Event();finish_tail=asyncio.Event();events=[];inputs=[]

@@ -717,7 +717,7 @@ class ProfileStore:
     def _group_context(self, group_id: int, limit: int) -> list[dict]:
         rows = self._conn.execute(
             "SELECT m.id, m.user_id, m.role, m.content, m.scene, m.group_id, m.routing, "
-            "COALESCE(p.nickname, '') AS nickname "
+            "m.created_at, COALESCE(p.nickname, '') AS nickname "
             "FROM user_messages m LEFT JOIN profiles p ON p.user_id = m.user_id "
             "WHERE m.scene = 'group' AND m.group_id = ? "
             "ORDER BY m.id DESC LIMIT ?",

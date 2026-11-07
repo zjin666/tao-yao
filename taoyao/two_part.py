@@ -98,15 +98,31 @@ class ScopedReplyGuard:
                 'tail' if sent else 'first',reason or 'allowed')
 
 
+def merge_overflow(text):
+    """Join overflow sentences into one bubble: no line breaks, no interior 。/；.
+    Quoted/bracketed spans are untouched; ！？… are kept."""
+    pairs={'「':'」','『':'』','“':'”','（':'）','(':')','[':']','【':'】','{':'}'}
+    out=[];stack=[]
+    for char in text.strip():
+        if char in pairs:stack.append(pairs[char])
+        elif stack and char==stack[-1]:stack.pop()
+        if stack:out.append(char);continue
+        out.append('，' if char in '。；;' else ('\n' if char=='\n' else char))
+    merged=''.join(out)
+    merged=re.sub(r'[ \t]*\n\s*','，',merged)
+    merged=re.sub(r'，{2,}','，',merged)
+    return re.sub(r'^，|，$','',merged)
+
+
 def split_approved_bubbles(text,limit):
-    """Split already-approved text locally; keep overflow intact in the last bubble."""
+    """Split already-approved text locally; overflow joins the last bubble as one clean run."""
     parts=[];remaining=text.strip();limit=max(1,int(limit))
     while remaining and len(parts)<limit-1:
         part,rest=first_sentence(remaining)
         if part is None:break
         if part.strip():parts.append(part.strip())
         remaining=rest.strip()
-    if remaining:parts.append(remaining)
+    if remaining:parts.append(merge_overflow(remaining))
     return parts
 
 
