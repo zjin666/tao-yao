@@ -714,25 +714,49 @@ class ProfileStore:
     async def annotation_context(self, user_id: int | str, scene: str, group_id: int, limit: int = 6, message_id: str = '') -> list[dict]:
         return await self._run(self._annotation_context,str(user_id),scene,int(group_id or 0),limit,message_id)
 
-    def _group_context(self, group_id: int, limit: int) -> list[dict]:
+    def _group_context(self, group_id: int, limit: int, max_age_seconds: int = 0,
+                       recall_seconds: int = 0) -> list[dict]:
+        """近 max_age_seconds 内的群消息；更早的只保留桃夭实际回复过的那段
+        （桃夭自己的回复和它所回应的那条消息），最远回溯 recall_seconds。"""
+        recent_age = int(max_age_seconds or 0)
+        recall_age = max(int(recall_seconds or 0), recent_age)
+        params: list = [int(group_id)]
+        age_clause, fetch_limit = "", int(limit)
+        recent_cutoff = ""
+        now = datetime.now(timezone.utc).timestamp()
+        if recent_age > 0:
+            recent_cutoff = datetime.fromtimestamp(now - recent_age, timezone.utc).isoformat(timespec="seconds")
+            cutoff = datetime.fromtimestamp(now - recall_age, timezone.utc).isoformat(timespec="seconds")
+            age_clause, params = " AND m.created_at >= ?", [int(group_id), cutoff]
+            fetch_limit = int(limit) * 6 if recall_age > recent_age else int(limit)
         rows = self._conn.execute(
             "SELECT m.id, m.user_id, m.role, m.content, m.scene, m.group_id, m.routing, "
             "m.created_at, COALESCE(p.nickname, '') AS nickname "
             "FROM user_messages m LEFT JOIN profiles p ON p.user_id = m.user_id "
-            "WHERE m.scene = 'group' AND m.group_id = ? "
-            "ORDER BY m.id DESC LIMIT ?",
-            (int(group_id), int(limit)),
+            "WHERE m.scene = 'group' AND m.group_id = ?" + age_clause +
+            " ORDER BY m.id DESC LIMIT ?",
+            (*params, fetch_limit),
         ).fetchall()
-        return [dict(row) for row in reversed(rows)]
+        rows = [dict(row) for row in reversed(rows)]
+        if recent_cutoff:
+            kept = []
+            for i, row in enumerate(rows):
+                replied_to = i + 1 < len(rows) and rows[i + 1].get("role") == "assistant"
+                if (str(row.get("created_at") or "") >= recent_cutoff
+                        or row.get("role") == "assistant" or replied_to):
+                    kept.append(row)
+            rows = kept[-int(limit):]
+        return rows
 
     async def group_context(self, group_id: int, limit: int = 16) -> list[dict]:
         return await self._run(self._group_context, int(group_id or 0), int(limit))
 
     def _reply_inputs(self, user_id: str, scene: str, group_id: int, limit: int,
                       include_private: bool, include_user_memory: bool,
-                      include_analysis: bool, analysis_limit: int, message_id: str) -> dict:
+                      include_analysis: bool, analysis_limit: int, message_id: str,
+                      group_max_age_seconds: int = 0, group_recall_seconds: int = 0) -> dict:
         if scene == "group":
-            history = self._group_context(group_id, limit)
+            history = self._group_context(group_id, limit, group_max_age_seconds, group_recall_seconds)
         else:
             history = self._recent_context(user_id, scene, group_id, limit, include_private)
         return {
@@ -748,11 +772,13 @@ class ProfileStore:
     async def reply_inputs(self, user_id: int | str, scene: str, group_id: int,
                            limit: int = 12, include_private: bool = False,
                            include_user_memory: bool = False, include_analysis: bool = False,
-                           analysis_limit: int = 6, message_id: str = "") -> dict:
+                           analysis_limit: int = 6, message_id: str = "",
+                           group_max_age_seconds: int = 0, group_recall_seconds: int = 0) -> dict:
         """每轮一次调度，复用上下文；不跨轮缓存，不影响后续画像更新。"""
         return await self._run(self._reply_inputs, str(user_id), scene, int(group_id or 0),
                                int(limit), include_private, include_user_memory,
-                               include_analysis, int(analysis_limit), str(message_id))
+                               include_analysis, int(analysis_limit), str(message_id),
+                               int(group_max_age_seconds), int(group_recall_seconds))
 
     def _private_context(self, user_id: str, limit: int) -> list[dict]:
         rows = self._conn.execute(
