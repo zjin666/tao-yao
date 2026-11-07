@@ -14,10 +14,6 @@
     "emotion",
     "meme-pack"
   ],
-  "icon": "previews/cover.jpg",
-  "previews": [
-    "previews/cover.jpg"
-  ],
   "source": {
     "type": "github",
     "repo": "local/tao-yao-meme-pack",
