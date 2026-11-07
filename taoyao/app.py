@@ -2441,8 +2441,21 @@ class TaoYaoBot:
             rows = await self.profiles.group_context(group_id, 6)
         except Exception:
             rows = []
+        # 话题定时器只在群安静后触发；太旧的消息不能当“最近”上下文，否则会像迟到的回复。
+        max_age = float(cfg.get("context_minutes", 20)) * 60
+        now_utc = datetime.now(timezone.utc)
+        fresh = []
+        for row in rows:
+            try:
+                created = datetime.fromisoformat(str(row.get("created_at") or ""))
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                if (now_utc - created).total_seconds() <= max_age:
+                    fresh.append(row)
+            except ValueError:
+                continue
         context = "\n".join(
-            f"{row.get('nickname') or '群友'}：{row.get('content') or ''}" for row in rows
+            f"{row.get('nickname') or '群友'}：{row.get('content') or ''}" for row in fresh
         ).strip()
         history_text = "\n".join(f"- {item}" for item in history_topics) or "（暂无）"
         requirements = ""
@@ -2456,11 +2469,11 @@ class TaoYaoBot:
         prompt = (
             "群聊安静了一阵，主动起一个轻松话题。"
             "1–2句，结合茶、书、花或日常。"
-            "不@，不提内部信息；以下旧话题不重复或改写。"
+            "不@，不提内部信息；不接续、不评论群里之前聊过的内容，要像重新开场；以下旧话题不重复或改写。"
             f"\n旧话题：\n{history_text}"
             f"\n本群公共要求：\n{requirements or '（暂无）'}"
         )
-        return ReplyIntent('',prompt,'最近群里的消息：\n'+(context or '（没人说话）'))
+        return ReplyIntent('',prompt,'最近群里的消息：\n'+(context or '（近期没人说话，请另起新话题）'))
 
     def _topic_slots(self, now: datetime) -> list[float]:
         cfg = self.config.get("group_topics") or {}
@@ -4315,6 +4328,10 @@ class TaoYaoBot:
         reply_time = self._current_time_text(profile, target_zone=requested_zone(raw_text or text)) if time_requested else ''
         if time_requested:
             log.info('本地时间工具：按需获取，时区=%s', requested_zone(raw_text or text) or self._timezone_for(profile))
+        # 自然插话/续话时图片描述可能在本条文本或最近历史里，同样适用“不复述画面”规则。
+        media_markers = ('[图片内容]', '[表情包内容]', '[视频内容]', '[表情包')
+        prompt_media_present = media_present or any(m in (text or '') for m in media_markers) or any(
+            m in str(item.get('content') or '') for item in history[-4:] for m in media_markers)
         def build_request(profile, search_context):
             tone_hint = self._tone_hint(profile)
             review_policy: dict = {}
@@ -4343,7 +4360,7 @@ class TaoYaoBot:
                 user_memory=user_memory,
                 group_requirements=group_requirements,
                 search_context=search_context,
-                media_present=media_present,
+                media_present=prompt_media_present,
                 quote_context=quote_context,
                 message_routing=self._group_routes.get((group_id, message_id)) if is_group else None,
                 review_policy=review_policy,
@@ -4426,7 +4443,7 @@ class TaoYaoBot:
                     if value:await early_guard.check('',value)
                     return raw,value,at
                 draft = StreamingDraft(early_request,self.llm.stream_chat,
-                    preview=preview_head if int(self.config['reply']['max_segments'] if role=='owner' else self._roles().get('user_max_segments',2))>1 else None,preview_guard=early_guard)
+                    preview=preview_head if int(self.config['reply']['max_segments'])>1 else None,preview_guard=early_guard)
             else:
                 draft = SpeculativeDraft(generation_request(deepcopy(profile), ''), generate_candidate)
         try:
@@ -4445,11 +4462,8 @@ class TaoYaoBot:
                 )
 
             messages, review_policy, departing, group_cfg = build_request(profile, search_context)
-            max_segments = (
-                int(self.config["reply"]["max_segments"])
-                if role == "owner"
-                else int(self._roles().get("user_max_segments", 2))
-            )
+            # 所有人使用同一套分段上限，不再按角色区分。
+            max_segments = int(self.config["reply"]["max_segments"])
             max_chars = int(self.config["reply"]["max_chars"])
             if departing:
                 max_segments = min(max_segments, 2)

@@ -189,7 +189,7 @@ SnowLuma 登录小号后，机器人日志会出现 `OneBot 已连接`。
 }
 ```
 
-普通好友的条数在 `roles.user_max_segments`，默认 2。
+所有人使用同一套条数上限，由 `reply.max_segments` 决定。
 
 ## 用户画像
 

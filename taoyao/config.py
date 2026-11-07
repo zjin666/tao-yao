@@ -79,7 +79,6 @@ DEFAULTS: dict[str, Any] = {
         "owner_group_require_at": True,
         "user_context_messages": 6,
         "group_context_messages": 10,
-        "user_max_segments": 2,
         "user_max_chars": 500,
         "user_rate_seconds": 2,
         "user_rate_per_minute": 12,
