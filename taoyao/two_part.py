@@ -133,6 +133,7 @@ def split_approved_bubbles(text,limit):
 class DeliveryResult:
     text: str
     complete: bool
+    handoff: bool = False   # 没发出，交给下一条消息的回复合并生成
 
 
 @dataclass
@@ -142,9 +143,10 @@ class PartsResult:
     complete: bool
     issue: str
     failed_stage: str = ''
+    leftover: str = ''      # 交接出去的、还没发出的内容（只作下一轮生成的上下文，不会被直接发送）
 
 
-async def send_checked_parts(stream,guard,prepare,deliver,*,early=True,prefix=''):
+async def send_checked_parts(stream,guard,prepare,deliver,*,early=True,prefix='',handoff_wait=1.5):
     queue=asyncio.Queue();emitted=[];approved=[]
     async def produce():
         buffer='';first=False
@@ -178,6 +180,16 @@ async def send_checked_parts(stream,guard,prepare,deliver,*,early=True,prefix=''
             if issue:return PartsResult(sent,'\n'.join(approved),False,issue,stage)
             ok=await deliver(pending,sent,guard)
             if isinstance(ok,DeliveryResult):
+                if ok.handoff:
+                    leftover=[pending]
+                    # 尽量把还在生成或排队的后续内容收完，一起交给下一轮；它只是上下文，之后的生成仍要过检查。
+                    try:
+                        while True:
+                            nxt,more=await asyncio.wait_for(queue.get(),timeout=handoff_wait)
+                            if nxt in('first','tail') and isinstance(more,str) and more.strip():leftover.append(more.strip())
+                            if nxt in('end','error'):break
+                    except asyncio.TimeoutError:pass
+                    return PartsResult(sent,'\n'.join(approved),True,'',leftover='\n'.join(leftover))
                 if ok.text:
                     emitted.append(ok.text);approved.append(raw if ok.complete else ok.text)
                 if not ok.complete:

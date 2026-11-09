@@ -8,8 +8,10 @@ from .group_requirements import (GLOBAL_LIMIT as GROUP_REQUIREMENT_GLOBAL_LIMIT,
     extract_messages, limit_from_member_count, parse_completion, parse_confirmation, parse_extraction)
 from .reply_flow import reply_boundary_issue
 from .reply_window import ReplyWindow, reply_window_context, conversation_session, current_reply_actor
-from .turn_timing import mark as mark_turn, timeline_once, turn_timing_context
+from .turn_timing import (get_value as get_turn_value, mark as mark_turn, set_value as set_turn_value,
+                          timeline_once, turn_timing_context)
 from .sqlite_tuning import WalCheckpointer
+from .typing_state import TypingTracker
 from .output_guard import NATURAL_RETRY, contains_internal_notice, guard_outgoing, clean_reply_envelope, internal_notice_reason, is_internal_only
 
 import asyncio
@@ -426,6 +428,9 @@ class TaoYaoBot:
         self._wal_checkpointer = None
         self._wal_task = None
         self._requirement_asked_id: dict[str, int] = {}
+        typing_cfg = config.get('typing_hold') or {}
+        self.typing = TypingTracker(float(typing_cfg.get('ttl_seconds', 30)))
+        self._held_tails: dict[str, dict] = {}
         log.info('正文模型：provider=%s model=%s',
                  getattr(self.llm, 'provider_name', 'mock'), getattr(self.llm, 'model', 'mock'))
         speed = config.get("response_speed") or {}
@@ -1204,6 +1209,9 @@ class TaoYaoBot:
         if notice == "poke" or (notice == "notify" and sub_type == "poke"):
             await self._handle_poke(data)
             return
+        if notice == "notify" and sub_type == "input_status":
+            self._note_input_status(data)
+            return
         try:
             group_id = int(data.get("group_id") or 0)
         except (TypeError, ValueError):
@@ -1792,6 +1800,9 @@ class TaoYaoBot:
             return
         owner = self._owner_qq()
         text = self._extract_text(data)
+        if message_type == "private" and user_id and getattr(self, "typing", None) is not None:
+            # 清掉这条消息之前的输入状态；命令（/开头）不算“又来了新消息”。
+            self.typing.message_received(user_id, message_id, bump=not text.lstrip().startswith("/"))
         annotation_raw_text = text
         annotation_sent_at = data.get("time")
         reply_session = conversation_session(group_id, user_id, owner)
@@ -4073,6 +4084,131 @@ class TaoYaoBot:
         value=await self._clean_output_symbols(guard_outgoing(value))
         return _clean_segment(sanitize_outgoing(value)),at_requested
 
+    def _note_input_status(self, data: dict[str, Any]) -> None:
+        """私聊“对方正在输入”事件：只记录时间，不触发任何回复。"""
+        try:
+            user_id = int(data.get("user_id") or 0)
+        except (TypeError, ValueError):
+            return
+        if not user_id or str(user_id) == str(data.get("self_id") or ""):
+            return
+        if getattr(self, "typing", None) is None:
+            return
+        event_type = data.get("event_type")
+        gap = self.typing.note(user_id, event_type)
+        if (self.config.get("typing_hold") or {}).get("log_events", True):
+            meaning = {1: "开始输入", 2: "停止输入", 3: "语音输入"}.get(event_type, "未知")
+            log.info("输入状态：user=%s event_type=%s(%s) 距上次输入事件=%s",
+                     user_id, event_type, meaning, "首次" if gap is None else f"{gap:.2f}s")
+
+    def _take_held_reply(self, session: str) -> str:
+        """上一轮因为对方还在输入而没发出的内容：取出并写成提示，让这一轮把它和新消息合成一次回复。"""
+        held = getattr(self, "_held_tails", {}).pop(session, None)
+        if not held:
+            return ""
+        limit = float((self.config.get("typing_hold") or {}).get("handoff_ttl_seconds", 120))
+        text = re.sub(r"\[\[[^\]]*\]\]", "", str(held.get("text") or "")).strip()
+        if not text or time.monotonic() - float(held.get("at", 0)) > limit:
+            return ""
+        if held.get("first_sent"):
+            lead = "你对上一条消息的回复，首句已经发出去了，但后面这部分因为用户还在输入而没有发出："
+        else:
+            lead = "你对上一条消息本来准备好的回复，因为用户还在输入而一句都没有发出："
+        return (
+            "\n\n【未发出的话】\n" + lead + "\n" + text + "\n"
+            "用户随后又发来了新消息。把这部分里仍然相关的内容，和对新消息的回应合成一次自然的回复："
+            "已经发出的话不重复，已经不相关的就不提，不要提起“没发出”这件事。")
+
+    async def _hold_while_typing(self, user_id: int, budget: dict, first: bool = False) -> str:
+        """首句（或尾部）已生成并检查好、准备发出的这一刻调用：决定发、先扣住，还是交接给下一条消息。
+        返回 send（可以发了）或 handoff（对方又发来新消息，没发出的内容交给下一条消息合并生成）。
+
+        1. 这轮回复发出之前，对方的新消息已经到了：立刻交接，不等（零延迟）。
+        2. 此时没有检测到在输入，就默认对方没有继续输入，直接发（默认不等）。可以用
+           typing_hold.first_sentence_grace_seconds（连发时用 first_sentence_grace_burst_seconds）给首句
+           加一个检测宽限，去抓比对方实际开始输入晚到几百毫秒的输入事件，但会让没续话的回复也慢这么久，
+           实测 5 次里只有 1 次有用，所以默认是 0。尾部：连发时（这条消息距上一条不到 burst_window_seconds）
+           要等到首句发出后 tail_grace_burst_seconds（默认 2 秒）才发，期间迟到的输入事件和新消息还能抓住，
+           首句速度不受影响；不连发时尾部不等。
+        3. 检测到在输入：扣住，等对方停下、发来新消息，或到达等待上限；收到“停止输入”后再等
+           typing_hold.stop_grace_seconds（该事件比消息本身早约 0.3 秒到达，发送消息也会触发它），
+           看消息有没有跟上来，没有才算对方真的停下。
+        一整段回复共用一个等待上限（budget），不会因为首句、尾部各等一次而翻倍；检测不影响首句的生成和检查。"""
+        cfg = self.config.get("typing_hold") or {}
+        tracker = getattr(self, "typing", None)
+        if tracker is None or not cfg.get("enabled", True):
+            return "send"
+        grace = max(0.0, float(cfg.get("stop_grace_seconds", 1.0)))
+        poll = max(0.02, float(cfg.get("poll_seconds", 0.15)))
+        if budget.get("seq") is None:
+            budget["seq"] = tracker.message_seq(user_id)
+        baseline = budget["seq"]
+
+        def new_message() -> bool:
+            return tracker.message_seq(user_id) != baseline
+
+        def waiting() -> bool:
+            return tracker.is_typing(user_id) or tracker.stopped_within(user_id, grace)
+
+        if new_message():
+            log.info("回复暂缓结束：user=%s 原因=新消息已到 本次等待=0.00s 处理=handoff", user_id)
+            return "handoff"
+        if not tracker.is_typing(user_id):
+            gap = get_turn_value("arrival_gap")
+            # 对方正在连发（这条消息距上一条很近）：他很可能还会再发。
+            bursting = gap is not None and gap <= float(cfg.get("burst_window_seconds", 15))
+            anchor = None
+            if first:
+                stage, label = "首句", "grace"
+                wait_for = max(0.0, float(cfg.get("first_sentence_grace_seconds", 0)))
+                if bursting:
+                    wait_for = max(wait_for, float(cfg.get("first_sentence_grace_burst_seconds", 0)))
+            else:
+                # 尾部的宽限从首句发出的那一刻算起：尾部自己的检查时间也计入，所以实际多等的只是差额。
+                stage, label = "尾部", "tail_grace"
+                wait_for = max(0.0, float(cfg.get("tail_grace_seconds", 0)))
+                if bursting:
+                    wait_for = max(wait_for, float(cfg.get("tail_grace_burst_seconds", 2.0)))
+                anchor = budget.get("anchor")
+            start = time.monotonic()
+            end = (anchor if anchor is not None else start) + wait_for
+            if wait_for <= 0 or end <= start:
+                return "send"
+            mark_turn(f"{label}_start")
+            while time.monotonic() < end and not new_message() and not tracker.is_typing(user_id):
+                await asyncio.sleep(min(poll, max(0.0, end - time.monotonic())))
+            mark_turn(f"{label}_end")
+            result = "handoff" if new_message() else ("hold" if tracker.is_typing(user_id) else "send")
+            log.info("%s宽限结束：user=%s 连发=%s 宽限=%.1fs 实际等待=%.2fs 结果=%s", stage, user_id,
+                     "是" if bursting else "否", wait_for, time.monotonic() - start,
+                     {"handoff": "新消息到达，交接", "hold": "检测到开始输入，转入扣住", "send": "没有动静，发出"}[result])
+            if result == "handoff":
+                return "handoff"
+            if result == "send":
+                return "send"
+        now = time.monotonic()
+        if budget.get("deadline") is None:
+            budget["deadline"] = now + max(0.0, float(cfg.get("max_hold_seconds", 15)))
+        if now >= budget["deadline"]:
+            return "send"
+        mark_turn("hold_start")
+        reason = "停止输入"
+        while True:
+            if new_message():
+                reason = "收到新消息"
+                break
+            if not waiting():
+                break
+            if time.monotonic() >= budget["deadline"]:
+                reason = "到达等待上限"
+                break
+            await asyncio.sleep(poll)
+        mark_turn("hold_end")
+        decision = "handoff" if new_message() else "send"
+        log.info("回复暂缓结束：user=%s 原因=%s 本次等待=%.2fs 处理=%s",
+                 user_id, reason, time.monotonic() - now, decision)
+        return decision
+
     async def _two_part_reply(self,messages,target,target_id,max_segments,max_chars,*,
             at_user_id,role,review_policy,reply_window_key,prefetched_text=None,prefetched_stream=None,prefetched_review=None,viewer_id=None,
             media_present=False):
@@ -4096,6 +4232,8 @@ class TaoYaoBot:
             at_requested=at_requested or at
             return value
         bubble_count=0
+        _tracker=getattr(self,'typing',None)
+        hold_budget={'seq':get_turn_value('arrival_seq',_tracker.message_seq(target_id) if _tracker is not None else None)}
         async def deliver(value,sent,checker):
             nonlocal last_sent,bubble_count
             order=getattr(self,'_image_order',None)
@@ -4103,6 +4241,12 @@ class TaoYaoBot:
                     and order.pending(target_id)):
                 log.info('首句发送前检测到图片处理，停止未发送草稿，由图片消息接续')
                 return False
+            if sent and last_sent is not None:
+                hold_budget['anchor']=last_sent    # 尾部宽限从首句发出的那一刻算起
+            if target=='private' and reply_window_key is not None:
+                # 对方发完消息还在输入：首句和尾部都已生成并检查好，先不发，等对方停下再发出。
+                if await self._hold_while_typing(target_id,hold_budget,first=not sent)=='handoff':
+                    return DeliveryResult('',True,handoff=True)
             pieces=split_approved_bubbles(value,max(1,max_segments-bubble_count)) if sent else [value]
             delivered=[]
             async def verify():
@@ -4149,6 +4293,13 @@ class TaoYaoBot:
         if not result.complete:
             log.warning('两段回复停止：stage=%s reason=%s sent_chars=%d',
                         result.failed_stage,result.issue,len(result.text))
+        if result.leftover and reply_window_key is not None:
+            # 对方还在输入时又发来新消息：没发出的内容交给下一条消息的回复一起合并生成。
+            if getattr(self,'_held_tails',None) is None:self._held_tails={}
+            self._held_tails[reply_window_key[0]]={'text':result.leftover,'at':time.monotonic(),
+                                                    'first_sent':bool(result.text)}
+            log.info('未发出的回复交给下一条消息合并：已发出首句=%s 字数=%d',bool(result.text),len(result.leftover))
+            return result.text,'',at_requested,False   # 这一轮的表情标签对应整段回复，不单独发
         if not result.text:return '', '', False, False
         # Metadata never enters checking, delivery, or memory. Ignore it on partial delivery.
         category=metadata.category if result.complete else ''
@@ -4224,6 +4375,12 @@ class TaoYaoBot:
         raw_text: str | None = None,
     ) -> None:
         self._cancel_reply_extras(session)
+        held_note = self._take_held_reply(session)
+        if not is_group and getattr(self, "typing", None) is not None:
+            own_seq = self.typing.seq_of(message_id)
+            if own_seq is not None:
+                set_turn_value("arrival_seq", own_seq)   # 之后序号变大 = 回复发出前又来了新消息
+            set_turn_value("arrival_gap", self.typing.gap_before(message_id))   # 距上一条消息的间隔，判断是否在连发
         profile: dict | None = None
         if is_group and self._group_reply_budget.paused(group_id, time.monotonic(), user_id):
             return
@@ -4650,6 +4807,7 @@ class TaoYaoBot:
                 reply_intent=feature_intent or ('这是别人想如何称呼桃夭，不是当前用户改昵称；不能由A替B登记或接受，需B本人亲自提出。自然请对方亲自来告诉你，不拿owner的旧昵称反复比较、拒绝或自称，不声称已联系对方。' if reported_nickname else ''),
             )
             system += knowledge_context
+            system += held_note
             messages = [{"role": "system", "content": system}]
             for item in history:
                 content = re.sub(
