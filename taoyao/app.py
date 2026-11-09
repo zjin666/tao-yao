@@ -12,6 +12,8 @@ from .turn_timing import (get_value as get_turn_value, mark as mark_turn, set_va
                           timeline_once, turn_timing_context)
 from .sqlite_tuning import WalCheckpointer
 from .typing_state import TypingTracker
+from .utterance import MAX_JUDGE_CHARS, judge_messages, parse_incomplete, worth_judging
+from .wait_habits import WaitHabits
 from .output_guard import NATURAL_RETRY, contains_internal_notice, guard_outgoing, clean_reply_envelope, internal_notice_reason, is_internal_only
 
 import asyncio
@@ -431,6 +433,7 @@ class TaoYaoBot:
         typing_cfg = config.get('typing_hold') or {}
         self.typing = TypingTracker(float(typing_cfg.get('ttl_seconds', 30)))
         self._held_tails: dict[str, dict] = {}
+        self.wait_habits = WaitHabits()
         log.info('正文模型：provider=%s model=%s',
                  getattr(self.llm, 'provider_name', 'mock'), getattr(self.llm, 'model', 'mock'))
         speed = config.get("response_speed") or {}
@@ -554,6 +557,12 @@ class TaoYaoBot:
             log.info("语义分类器预热完成：%s", type(self.classifier).__name__)
         except Exception:
             log.exception("语义分类器预热失败")
+        if self.profiles_enabled:
+            try:
+                for key, data in (await self.profiles.load_wait_habits()).items():
+                    self.wait_habits.load(key, data)
+            except Exception:
+                log.exception("读取等待习惯失败，按默认值开始")
         await self.server.start()
         interval = float((self.config.get("sqlite") or {}).get("checkpoint_seconds", 60))
         if interval > 0:
@@ -1676,6 +1685,8 @@ class TaoYaoBot:
 
     async def _enqueue(self, item: PendingMessage) -> None:
         item.enqueued_monotonic = time.monotonic()
+        if item.is_group:
+            self._note_group_arrival(item.group_id, item.user_id, item.message_id, item.text)
         if not self.batch_enabled:
             lock = self._locks.setdefault(item.session, asyncio.Lock())
             async with lock:
@@ -1986,6 +1997,7 @@ class TaoYaoBot:
                                 high_priority=True,
                                 same_topic=same_topic,
                                 group_familiarity=group_familiarity,
+                                message_id=message_id,
                             ):
                                 return
                 dice_hit = random.random() < float(
@@ -2000,6 +2012,7 @@ class TaoYaoBot:
                     f"group:{group_id}",
                     dice_roll=dice_hit,
                     group_familiarity=group_familiarity,
+                    message_id=message_id,
                 ):
                     return
             if require_at and not mentioned:
@@ -2458,6 +2471,7 @@ class TaoYaoBot:
         high_priority: bool = False,
         same_topic: bool = False,
         group_familiarity: str = "stranger",
+        message_id: str = "",
     ) -> bool:
         cfg = self._ambient_config()
         if self._group_reply_budget.paused(group_id, time.monotonic(), user_id):
@@ -2499,6 +2513,7 @@ class TaoYaoBot:
             "群聊自然插话：group=%s count=%s dice=%s high=%s same_topic=%s",
             group_id, count, dice_roll, high_priority, same_topic,
         )
+        self._note_group_arrival(group_id, user_id, message_id, text)
         lock = self._locks.setdefault(session, asyncio.Lock())
         async with lock:
             await self._handle_text(
@@ -2512,6 +2527,7 @@ class TaoYaoBot:
                 is_group=True,
                 group_id=group_id,
                 scene="group",
+                message_id=message_id,
                 ambient=True,
                 pre_stored=True,
                 group_familiarity=group_familiarity,
@@ -4101,11 +4117,104 @@ class TaoYaoBot:
             log.info("输入状态：user=%s event_type=%s(%s) 距上次输入事件=%s",
                      user_id, event_type, meaning, "首次" if gap is None else f"{gap:.2f}s")
 
-    def _take_held_reply(self, session: str) -> str:
+    @staticmethod
+    def _reply_scope_key(is_group: bool, group_id: int, user_id: int):
+        """跟踪“这个人的新消息”的键：私聊就是对方 QQ；群聊是（群，人），不同人、不同群互不影响。"""
+        return ("g", int(group_id), int(user_id)) if is_group else int(user_id)
+
+    @staticmethod
+    def _scoped_message_id(is_group: bool, group_id: int, user_id: int, message_id: str) -> str:
+        return f"g{int(group_id)}:{int(user_id)}:{message_id}" if is_group else str(message_id)
+
+    def _note_group_arrival(self, group_id: int, user_id: int, message_id: str, text: str) -> None:
+        """群里这个人的又一条消息进入了回复流程（被叫到或自然插话）：序号加一，供上一条的回复交接。
+        只在消息确实会被处理时才记，没人回应的普通群聊不会让别人的回复被交接走。"""
+        cfg = self.config.get("typing_hold") or {}
+        if getattr(self, "typing", None) is None or not cfg.get("enabled", True) or not cfg.get("group_enabled", True):
+            return
+        self.typing.message_received(
+            self._reply_scope_key(True, group_id, user_id),
+            self._scoped_message_id(True, group_id, user_id, message_id),
+            bump=not (text or "").lstrip().startswith("/"))
+
+    @staticmethod
+    def _habit_key(user_key) -> str:
+        """等待习惯的键：私聊按对方 QQ，群聊按（群，人）。"""
+        return f"g:{user_key[1]}:{user_key[2]}" if isinstance(user_key, tuple) else f"p:{user_key}"
+
+    def _incomplete_wait_limits(self, private: bool) -> tuple[float, float, float]:
+        """（默认等待，下限，上限）。"""
+        cfg = self.config.get("typing_hold") or {}
+        floor = max(0.0, float(cfg.get("incomplete_wait_min_seconds", 1.0)))
+        if private:
+            default, ceil = float(cfg.get("incomplete_wait_seconds", 4.0)), float(cfg.get("incomplete_wait_max_seconds", 8.0))
+        else:
+            default = float(cfg.get("incomplete_wait_group_seconds", 3.0))
+            ceil = float(cfg.get("incomplete_wait_group_max_seconds", 6.0))
+        # 配置的默认值比下限小/比上限大时，以配置为准，下限和上限不去改它。
+        return default, min(floor, default), max(ceil, default)
+
+    def _record_wait_outcome(self, user_key, private: bool, *, hit: bool, delay: float | None = None) -> None:
+        """记下一次“判为没说完”的结果，让这个人的等待时间慢慢向他的习惯靠拢，并存盘（后台，不阻塞）。"""
+        cfg = self.config.get("typing_hold") or {}
+        habits = getattr(self, "wait_habits", None)
+        if habits is None or not cfg.get("incomplete_adapt", True):
+            return
+        default, floor, ceil = self._incomplete_wait_limits(private)
+        key = self._habit_key(user_key)
+        before = habits.snapshot(key)
+        state = habits.record(key, hit=hit, delay=delay, default=default, floor=floor, ceil=ceil)
+        log.info("等待习惯更新：%s 结果=%s 等待 %.1fs→%.1fs 命中率=%.2f%s", key,
+                 "等到下一条" if hit else "白等",
+                 (before or {"wait": default})["wait"], state["wait"], state["p"],
+                 f" 暂停{state['pause']}次" if state["pause"] else "")
+        profiles = getattr(self, "profiles", None)
+        if profiles is not None and getattr(self, "profiles_enabled", False):
+            task = asyncio.create_task(profiles.save_wait_habit(key, state), context=Context())
+            self._memory_tasks.add(task)
+            task.add_done_callback(self._memory_tasks.discard)
+
+    def _start_incomplete_judge(self, text: str, is_group: bool, command: str = ""):
+        """和生成回复并行：让辅助模型判断这句话是不是明显还没说完。不阻塞任何东西。"""
+        cfg = self.config.get("typing_hold") or {}
+        if (not cfg.get("enabled", True) or not cfg.get("incomplete_enabled", True)
+                or (is_group and not cfg.get("group_enabled", True))
+                or command.startswith("/")
+                or not worth_judging(text, int(cfg.get("incomplete_max_chars", MAX_JUDGE_CHARS)))):
+            return None
+
+        async def judge():
+            try:
+                reply = await getattr(self, "utility_llm", self.llm).chat(judge_messages(text))
+                verdict = parse_incomplete(reply)
+                if verdict:
+                    log.info("未说完判断：判定=未说完 文本=%s", re.sub(r"\s+", " ", text)[:30])
+                return verdict
+            except Exception:
+                log.debug("判断是否说完失败", exc_info=True)
+                return None
+        return asyncio.create_task(judge(), context=Context())
+
+    @staticmethod
+    def _judged_incomplete() -> bool:
+        """并行判断已经出结果且是“没说完”才算；还没出结果就当作说完了，绝不为它等待。"""
+        task = get_turn_value("incomplete_task")
+        if task is None or not task.done() or task.cancelled():
+            return False
+        try:
+            return task.result() is True
+        except Exception:
+            return False
+
+    def _take_held_reply(self, session: str, user_id=None) -> str:
         """上一轮因为对方还在输入而没发出的内容：取出并写成提示，让这一轮把它和新消息合成一次回复。"""
-        held = getattr(self, "_held_tails", {}).pop(session, None)
+        pending = getattr(self, "_held_tails", {})
+        held = pending.get(session)
         if not held:
             return ""
+        if user_id is not None and held.get("user_id") not in (None, user_id):
+            return ""   # 群里别人的消息不取走这个人没发出的回复
+        pending.pop(session, None)
         limit = float((self.config.get("typing_hold") or {}).get("handoff_ttl_seconds", 120))
         text = re.sub(r"\[\[[^\]]*\]\]", "", str(held.get("text") or "")).strip()
         if not text or time.monotonic() - float(held.get("at", 0)) > limit:
@@ -4119,7 +4228,7 @@ class TaoYaoBot:
             "用户随后又发来了新消息。把这部分里仍然相关的内容，和对新消息的回应合成一次自然的回复："
             "已经发出的话不重复，已经不相关的就不提，不要提起“没发出”这件事。")
 
-    async def _hold_while_typing(self, user_id: int, budget: dict, first: bool = False) -> str:
+    async def _hold_while_typing(self, user_id, budget: dict, first: bool = False, private: bool = True) -> str:
         """首句（或尾部）已生成并检查好、准备发出的这一刻调用：决定发、先扣住，还是交接给下一条消息。
         返回 send（可以发了）或 handoff（对方又发来新消息，没发出的内容交给下一条消息合并生成）。
 
@@ -4138,6 +4247,8 @@ class TaoYaoBot:
         tracker = getattr(self, "typing", None)
         if tracker is None or not cfg.get("enabled", True):
             return "send"
+        if not private and not cfg.get("group_enabled", True):
+            return "send"
         grace = max(0.0, float(cfg.get("stop_grace_seconds", 1.0)))
         poll = max(0.02, float(cfg.get("poll_seconds", 0.15)))
         if budget.get("seq") is None:
@@ -4152,7 +4263,35 @@ class TaoYaoBot:
 
         if new_message():
             log.info("回复暂缓结束：user=%s 原因=新消息已到 本次等待=0.00s 处理=handoff", user_id)
+            if first and self._judged_incomplete():
+                self._record_wait_outcome(user_id, private, hit=True)
             return "handoff"
+        if first and self._judged_incomplete():
+            # 并行判断：这句话明显没说完，同一个人很可能马上接着发，多等一会儿；等到新消息就交接合并。
+            default_wait, wait_floor, wait_ceil = self._incomplete_wait_limits(private)
+            wait_for = max(0.0, default_wait)
+            habits = getattr(self, "wait_habits", None)
+            if habits is not None and cfg.get("incomplete_adapt", True):
+                # 这个人自己的等待时间：按他以往发出下一条的习惯慢慢调整；暂停期间为 0。
+                wait_for = habits.wait_for(self._habit_key(user_id), default_wait, wait_floor, wait_ceil)
+            if wait_for > 0:
+                start = time.monotonic()
+                end = start + wait_for
+                mark_turn("incomplete_wait_start")
+                while time.monotonic() < end and not new_message() and not tracker.is_typing(user_id):
+                    await asyncio.sleep(min(poll, max(0.0, end - time.monotonic())))
+                mark_turn("incomplete_wait_end")
+                result = "handoff" if new_message() else ("hold" if tracker.is_typing(user_id) else "send")
+                log.info("未说完等待结束：user=%s 最多等=%.1fs 实际=%.2fs 结果=%s", user_id, wait_for,
+                         time.monotonic() - start,
+                         {"handoff": "新消息到达，交接", "hold": "检测到开始输入，转入扣住", "send": "没有等到，发出"}[result])
+                self._record_wait_outcome(
+                    user_id, private, hit=result != "send",
+                    delay=(time.monotonic() - start) if result == "handoff" else None)
+                if result == "handoff":
+                    return "handoff"
+                if result == "send":
+                    return "send"
         if not tracker.is_typing(user_id):
             gap = get_turn_value("arrival_gap")
             # 对方正在连发（这条消息距上一条很近）：他很可能还会再发。
@@ -4166,8 +4305,8 @@ class TaoYaoBot:
             else:
                 # 尾部的宽限从首句发出的那一刻算起：尾部自己的检查时间也计入，所以实际多等的只是差额。
                 stage, label = "尾部", "tail_grace"
-                wait_for = max(0.0, float(cfg.get("tail_grace_seconds", 0)))
-                if bursting:
+                wait_for = max(0.0, float(cfg.get("tail_grace_seconds", 0))) if private else 0.0
+                if bursting and private:
                     wait_for = max(wait_for, float(cfg.get("tail_grace_burst_seconds", 2.0)))
                 anchor = budget.get("anchor")
             start = time.monotonic()
@@ -4233,7 +4372,9 @@ class TaoYaoBot:
             return value
         bubble_count=0
         _tracker=getattr(self,'typing',None)
-        hold_budget={'seq':get_turn_value('arrival_seq',_tracker.message_seq(target_id) if _tracker is not None else None)}
+        hold_key=(target_id if target=='private' else
+                  self._reply_scope_key(True,target_id,(reply_window_key or (0,0))[1]))
+        hold_budget={'seq':get_turn_value('arrival_seq',_tracker.message_seq(hold_key) if _tracker is not None else None)}
         async def deliver(value,sent,checker):
             nonlocal last_sent,bubble_count
             order=getattr(self,'_image_order',None)
@@ -4243,9 +4384,9 @@ class TaoYaoBot:
                 return False
             if sent and last_sent is not None:
                 hold_budget['anchor']=last_sent    # 尾部宽限从首句发出的那一刻算起
-            if target=='private' and reply_window_key is not None:
+            if target in ('private','group') and reply_window_key is not None:
                 # 对方发完消息还在输入：首句和尾部都已生成并检查好，先不发，等对方停下再发出。
-                if await self._hold_while_typing(target_id,hold_budget,first=not sent)=='handoff':
+                if await self._hold_while_typing(hold_key,hold_budget,first=not sent,private=target=='private')=='handoff':
                     return DeliveryResult('',True,handoff=True)
             pieces=split_approved_bubbles(value,max(1,max_segments-bubble_count)) if sent else [value]
             delivered=[]
@@ -4297,7 +4438,7 @@ class TaoYaoBot:
             # 对方还在输入时又发来新消息：没发出的内容交给下一条消息的回复一起合并生成。
             if getattr(self,'_held_tails',None) is None:self._held_tails={}
             self._held_tails[reply_window_key[0]]={'text':result.leftover,'at':time.monotonic(),
-                                                    'first_sent':bool(result.text)}
+                                                    'first_sent':bool(result.text),'user_id':reply_window_key[1]}
             log.info('未发出的回复交给下一条消息合并：已发出首句=%s 字数=%d',bool(result.text),len(result.leftover))
             return result.text,'',at_requested,False   # 这一轮的表情标签对应整段回复，不单独发
         if not result.text:return '', '', False, False
@@ -4375,12 +4516,16 @@ class TaoYaoBot:
         raw_text: str | None = None,
     ) -> None:
         self._cancel_reply_extras(session)
-        held_note = self._take_held_reply(session)
-        if not is_group and getattr(self, "typing", None) is not None:
-            own_seq = self.typing.seq_of(message_id)
+        held_note = self._take_held_reply(session, user_id)
+        if getattr(self, "typing", None) is not None:
+            scoped_id = self._scoped_message_id(is_group, group_id, user_id, message_id)
+            own_seq = self.typing.seq_of(scoped_id)
             if own_seq is not None:
-                set_turn_value("arrival_seq", own_seq)   # 之后序号变大 = 回复发出前又来了新消息
-            set_turn_value("arrival_gap", self.typing.gap_before(message_id))   # 距上一条消息的间隔，判断是否在连发
+                set_turn_value("arrival_seq", own_seq)   # 之后序号变大 = 回复发出前这个人又来了新消息
+            set_turn_value("arrival_gap", self.typing.gap_before(scoped_id))   # 距上一条消息的间隔，判断是否在连发
+        judge = self._start_incomplete_judge(raw_text if raw_text is not None else text, is_group)
+        if judge is not None:
+            set_turn_value("incomplete_task", judge)    # 和生成并行，发出前再看结果
         profile: dict | None = None
         if is_group and self._group_reply_budget.paused(group_id, time.monotonic(), user_id):
             return

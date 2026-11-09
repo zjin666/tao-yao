@@ -654,7 +654,7 @@ class MergeEndToEnd(unittest.IsolatedAsyncioTestCase):
         bot = self.bot
         seen = []
 
-        async def spy(user_id, budget, first=False):
+        async def spy(user_id, budget, first=False, private=True):
             seen.append((first, get_value('arrival_gap')))
             return 'send'
         bot._hold_while_typing = spy

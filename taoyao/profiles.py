@@ -151,6 +151,8 @@ class ProfileStore:
             item_cols = [row[1] for row in self._conn.execute("PRAGMA table_info(group_requirement_items)").fetchall()]
             if "asked" not in item_cols:
                 self._conn.execute("ALTER TABLE group_requirement_items ADD COLUMN asked INTEGER NOT NULL DEFAULT 0")
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS wait_habits (key TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at TEXT NOT NULL)")
             # 旧版每个群只有一条要求：一次性搬进新表（长期、已生效），搬完清空旧表，不会重复搬。
             self._conn.execute(
                 "INSERT INTO group_requirement_items(group_id, content, kind, status, created_at, confirmed_at) "
@@ -1100,6 +1102,31 @@ class ProfileStore:
             self._conn.execute(
                 "DELETE FROM group_requirement_items WHERE status = 'pending' AND created_by = ?",
                 (str(created_by),))
+
+    def _load_wait_habits(self) -> dict[str, dict]:
+        rows = self._conn.execute("SELECT key, data FROM wait_habits").fetchall()
+        result = {}
+        for row in rows:
+            try:
+                value = json.loads(row["data"])
+            except ValueError:
+                continue
+            if isinstance(value, dict):
+                result[str(row["key"])] = value
+        return result
+
+    def _save_wait_habit(self, key: str, data: dict) -> None:
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO wait_habits(key, data, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+                (str(key), json.dumps(data, ensure_ascii=False), _now()))
+
+    async def load_wait_habits(self) -> dict[str, dict]:
+        return await self._run(self._load_wait_habits)
+
+    async def save_wait_habit(self, key: str, data: dict) -> None:
+        await self._run(self._save_wait_habit, str(key), data)
 
     async def get_group_requirements(self, group_id: int) -> list[str]:
         return await self._run(self._get_group_requirements, int(group_id))

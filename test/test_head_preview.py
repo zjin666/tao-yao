@@ -43,7 +43,10 @@ class HeadPreviewTests(unittest.IsolatedAsyncioTestCase):
                 release_search.set()
                 await asyncio.wait_for(task,3)
                 self.assertEqual(bot.server.send_text.await_count,2)
-                self.assertEqual(bot.utility_llm.chat.await_count,3 if changed else 2)
+                # Count only the reply checker; the parallel "is the sentence unfinished" judge is a separate call.
+                reviews=[c for c in bot.utility_llm.chat.await_args_list
+                         if c.args[0][0]['content'].startswith('发送前检查器')]
+                self.assertEqual(len(reviews),3 if changed else 2)
                 if changed:
                     self.assertEqual(len(requests),2)
                     self.assertNotIn('旧草稿',str(bot.server.send_text.await_args_list))

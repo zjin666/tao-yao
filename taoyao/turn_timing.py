@@ -17,6 +17,8 @@ _LABELS = (
     ('grace_end', '首句宽限结束'),
     ('tail_grace_start', '尾部宽限开始'),
     ('tail_grace_end', '尾部宽限结束'),
+    ('incomplete_wait_start', '未说完等待开始'),
+    ('incomplete_wait_end', '未说完等待结束'),
     ('hold_start', '开始扣住'),
     ('hold_end', '扣住结束'),
     ('send_start', '开始发送'),
