@@ -355,5 +355,15 @@ class MediaDescriber:
                         pass
         return await asyncio.to_thread(self._ocr_image, path)
 
+    async def describe_frames(self, frames: list[Path], prompt: str) -> str:
+        """把已经截好的几帧交给视觉模型；没配置视觉 API 时返回空。"""
+        if not self.enabled or not self._api_ready() or not frames:
+            return ""
+        try:
+            return await self._api_describe(frames, prompt)
+        except Exception as exc:
+            log.warning("视觉 API 看视频帧失败：%s", exc)
+            return ""
+
     async def close(self) -> None:
         return None

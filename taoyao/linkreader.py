@@ -13,7 +13,9 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
-LINK_RE = re.compile(r"https?://[^\s<>\"'）)】,，。；;！!？?、]+", re.IGNORECASE)
+BILI_ID_RE = re.compile(r"/video/(BV[0-9A-Za-z]{10}|av\d+)", re.IGNORECASE)
+BILI_HOSTS = ("bilibili.com", "b23.tv")
+LINK_RE = re.compile(r"https?://[^\s<>\"'）)】,，。；;！？、]+", re.IGNORECASE)
 
 
 _MEDIA_SUFFIXES = (
@@ -78,6 +80,7 @@ class LinkReader:
         self.max_chars = int(cfg.get("max_chars", 2000))
         self.max_bytes = int(cfg.get("max_bytes", 1024 * 1024))
         self.max_urls = max(1, int(cfg.get("max_urls", 2)))
+        self.video_watcher = None          # 由应用设置：看视频画面（VideoWatcher.watch）
         self.user_agent = str(
             cfg.get("user_agent")
             or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
@@ -112,9 +115,65 @@ class LinkReader:
                 return False, "不允许访问内网地址"
         return True, ""
 
+    @staticmethod
+    def _is_bilibili(url: str) -> bool:
+        host = (urlparse(url).hostname or "").lower()
+        return any(host == h or host.endswith("." + h) for h in BILI_HOSTS)
+
+    async def _fetch_bilibili(self, url: str) -> LinkResult | None:
+        """B 站视频：普通网页抓取只会得到“视频去哪了”的空壳，改走官方接口读标题/简介/作者/分P。
+        拿不到就返回 None，让调用方按普通网页处理。"""
+        headers = {"User-Agent": self.user_agent, "Referer": "https://www.bilibili.com/"}
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout, headers=headers, follow_redirects=False) as client:
+                current = url
+                for _ in range(4):                       # b23.tv 短链：手动跟随跳转并逐跳检查地址
+                    match = BILI_ID_RE.search(urlparse(current).path)
+                    if match or not self._is_bilibili(current):
+                        break
+                    response = await client.get(current)
+                    location = response.headers.get("location")
+                    if response.status_code not in (301, 302, 303, 307, 308) or not location:
+                        break
+                    current = urljoin(current, location)
+                    ok, _ = await asyncio.to_thread(self._safe_host, current)
+                    if not ok or not self._is_bilibili(current):
+                        return None
+                match = BILI_ID_RE.search(urlparse(current).path)
+                if not match:
+                    return None
+                vid = match.group(1)
+                params = {"aid": vid[2:]} if vid.lower().startswith("av") else {"bvid": vid}
+                await client.get("https://www.bilibili.com/")      # 取一次 cookie，否则接口会 412
+                data = (await client.get("https://api.bilibili.com/x/web-interface/view", params=params)).json()
+        except Exception as exc:
+            logging.getLogger(__name__).debug("B站读取失败：%s", exc)
+            return None
+        info = data.get("data") if data.get("code") == 0 else None
+        if not info:
+            return LinkResult(url, error=f"B站视频不可读（code={data.get('code')}）")
+        pages = [str(p.get("part", "")).strip() for p in (info.get("pages") or []) if p.get("part")]
+        stat = info.get("stat") or {}
+        lines = [
+            f"B站视频，作者：{(info.get('owner') or {}).get('name', '')}，分区：{info.get('tname', '')}，"
+            f"时长 {int(info.get('duration') or 0)} 秒，播放 {stat.get('view', 0)}、点赞 {stat.get('like', 0)}。",
+        ]
+        if str(info.get("desc", "")).strip() and info.get("desc") != "-":
+            lines.append("简介：" + re.sub(r"\s+", " ", str(info["desc"])).strip())
+        if len(pages) > 1:
+            lines.append("分P：" + "；".join(pages[:8]))
+        return LinkResult(current, title=str(info.get("title", ""))[:200], text="\n".join(lines)[: self.max_chars])
+
     async def fetch(self, url: str) -> LinkResult:
         if not self.enabled:
             return LinkResult(url, error="链接读取没开")
+        if self._is_bilibili(url):
+            ok, why = await asyncio.to_thread(self._safe_host, url)
+            if not ok:
+                return LinkResult(url, error=why)
+            result = await self._fetch_bilibili(url)
+            if result is not None:
+                return result
         ok, why = await asyncio.to_thread(self._safe_host, url)
         if not ok:
             return LinkResult(url, error=why)
@@ -163,16 +222,29 @@ class LinkReader:
         except Exception as exc:
             return LinkResult(url, error=f"抓取失败：{exc}")
 
+    async def _watch(self, url: str) -> str:
+        watcher = self.video_watcher
+        # B站的标题、作者、简介已经由专用接口读到，视频部分只需要画面概括。
+        return await watcher.watch(url, with_meta=not self._is_bilibili(url)) if watcher is not None else ""
+
     async def fetch_text(self, text: str) -> str:
         links = extract_links(text)[: self.max_urls]
         if not links:
             return ""
-        results = await asyncio.gather(*(self.fetch(url) for url in links))
+        pages, watched = await asyncio.gather(
+            asyncio.gather(*(self.fetch(url) for url in links)),
+            asyncio.gather(*(self._watch(url) for url in links)),
+        )
         parts = []
-        for result in results:
-            if result.text:
+        for result, video in zip(pages, watched):
+            if result.text or video:
                 title = f"《{result.title}》" if result.title else ""
-                parts.append(f"[链接内容 {result.url}] {title}\n{result.text}")
+                body = result.text
+                if video:
+                    body = f"{body}\n{video}".strip()
+                elif self._is_bilibili(result.url) and result.text:
+                    body += "\n（只读到标题、简介等文字信息，没有看视频画面和声音。）"
+                parts.append(f"[链接内容 {result.url}] {title}\n{body}")
             else:
                 logging.getLogger(__name__).debug("链接读取失败：%s", result.error or "无正文")
                 parts.append(

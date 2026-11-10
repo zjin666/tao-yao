@@ -42,6 +42,7 @@ from .name_preferences import rejected_user_names, name_key
 from .annotation import AnalysisPipeline
 from .guard import Guard
 from .linkreader import LinkReader, extract_links
+from .videolink import VideoWatcher
 from .llm import LLMError, create_llm, llm_request_settings
 from .memes import MemeLibrary
 from .user_memes import UserMemeLibrary
@@ -455,6 +456,9 @@ class TaoYaoBot:
         self.guard = Guard(config)
         self.vision = MediaDescriber(config.get("vision") or {})
         self.links = LinkReader(config.get("links") or {})
+        self.links.video_watcher = VideoWatcher(
+            config.get("links") or {}, getattr(self.vision, "_ffmpeg", None),
+            self.vision.describe_frames, Path(getattr(self.vision, "work_dir", Path("data/media"))))
         self.web_search = WebSearchClient(
             int((config.get("search") or {}).get("max_results", 5))
         )
