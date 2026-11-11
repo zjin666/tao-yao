@@ -4326,7 +4326,10 @@ class TaoYaoBot:
         friends = [uid for uid in await self._friend_ids() if uid and uid != self_uin]
         budget = min(pc["per_cycle"], pc["per_hour"] - state.count_commented(3600))
         counts = self.__dict__.setdefault("_qzone_friend_counts", {})
+        no_access = self.__dict__.setdefault("_qzone_no_access", {})
         for uin in friends:
+            if time.monotonic() - no_access.get(uin, -1e9) < 12 * 3600:
+                continue                                                  # 对方空间设了权限，刚试过读不了，过一阵再说
             try:
                 listing = await self.server.call("get_qzone_msg_list", {"target_uin": uin, "num": 5}, timeout=30)
             except OneBotError:
@@ -4335,7 +4338,11 @@ class TaoYaoBot:
                 log.debug("读好友说说失败：%s", uin, exc_info=True)
                 continue
             if not self._onebot_ok(listing):
-                continue                                                  # 没权限或对方没有说说，不是问题
+                text = json.dumps(listing, ensure_ascii=False) if isinstance(listing, dict) else str(listing)
+                if re.search(r"10031|保密|没有权限", text):
+                    no_access[uin] = time.monotonic()                     # 没权限看对方的空间，12 小时内不再试
+                    log.info("没有权限看好友的空间，12 小时内不再试：%s", uin)
+                continue
             posts = (listing.get("data") or {}).get("msglist") or []
             # 对方回复了我的评论 -> 才继续聊（只跟进评论数变了的、我评论过的说说）
             for post in posts:

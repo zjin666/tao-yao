@@ -175,6 +175,43 @@ class CycleTests(unittest.IsolatedAsyncioTestCase):
             await bot2._qzone_proactive_cycle()
             self.assertEqual(len(sent_comments(bot2)), 1)
 
+    async def test_a_friend_whose_space_is_private_is_not_retried_every_cycle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bot = make_bot({'decision': 'comment'}, tmp)
+            original = bot.server.call
+            listed = []
+
+            async def call(action, params, timeout=0):
+                if action == 'get_qzone_msg_list' and params.get('target_uin') == FRIEND:
+                    listed.append(1)
+                    return {'status': 'failed', 'wording': 'qzone msglist failed: code=-10031 对不起,主人设置了保密,您没有权限查看'}
+                return await original(action, params, timeout)
+            bot.server.call = call
+            await bot._qzone_proactive_cycle()
+            await bot._qzone_proactive_cycle()
+            await bot._qzone_proactive_cycle()
+            self.assertEqual(len(listed), 1)                                # asked once, then left alone for hours
+            self.assertEqual(sent_comments(bot), [])
+            bot._qzone_no_access[FRIEND] -= 13 * 3600                       # after 12 hours it is tried again
+            await bot._qzone_proactive_cycle()
+            self.assertEqual(len(listed), 2)
+
+    async def test_an_empty_or_failed_listing_for_other_reasons_is_still_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bot = make_bot({'decision': 'comment'}, tmp)
+            original = bot.server.call
+            listed = []
+
+            async def call(action, params, timeout=0):
+                if action == 'get_qzone_msg_list' and params.get('target_uin') == FRIEND:
+                    listed.append(1)
+                    return {'status': 'failed', 'wording': '网络超时'}
+                return await original(action, params, timeout)
+            bot.server.call = call
+            await bot._qzone_proactive_cycle()
+            await bot._qzone_proactive_cycle()
+            self.assertEqual(len(listed), 2)
+
     async def test_a_failed_send_is_not_recorded_as_commented(self):
         with tempfile.TemporaryDirectory() as tmp:
             bot = make_bot({'decision': 'comment'}, tmp)
