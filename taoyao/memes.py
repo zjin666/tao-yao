@@ -10,6 +10,9 @@ from typing import Any
 
 
 # Caring speech acts, rather than merely mentioning food, tiredness or greetings.
+MIN_SCORE = 0.62          # 桃夭自己没打标签时，本地判断至少要这么有把握才发表情包
+KEYWORD_BOOST = 0.18      # 命中字面关键词只给语义分加这么多
+
 CARE_REMINDER_RE = re.compile(
     r'(?:记得|别忘了|要记着).{0,8}(?:吃饭|吃点|喝水|补水|补点能量|补充(?:能量|体力)|休息|保暖|添衣)|'
     r'(?:别|不要|不许).{0,5}(?:空腹|硬撑|撑着|逞强|饿着|饿坏|累坏|熬夜|着凉|冻着)|'
@@ -200,10 +203,16 @@ class MemeLibrary:
             last_scores.update(self._semantic_scores(last))
         except Exception:
             pass
-        if keyword_full:
-            full_scores[keyword_full] = max(full_scores.get(keyword_full, 0.0), 0.8)
-        if keyword_last:
-            last_scores[keyword_last] = max(last_scores.get(keyword_last, 0.0), 0.8)
+        # 字面关键词（“累”“卡”“较劲”这类话题里的词）只能给语义分加一点，不能单独把一个分类顶到 0.8；
+        # 没有语义模型时（比如测试环境）才退回旧办法，直接按关键词定。
+        has_semantic = bool(full_scores or last_scores)
+        for keyword, bucket in ((keyword_full, full_scores), (keyword_last, last_scores)):
+            if not keyword:
+                continue
+            if has_semantic:
+                bucket[keyword] = min(0.95, bucket.get(keyword, 0.0) + KEYWORD_BOOST)
+            else:
+                bucket[keyword] = max(bucket.get(keyword, 0.0), 0.8)
         categories = set(full_scores) | set(last_scores)
         scores = {
             cat: last_scores.get(cat, 0.0) * 0.75 + full_scores.get(cat, 0.0) * 0.25
@@ -230,8 +239,8 @@ class MemeLibrary:
         ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)[:max(1, top_k)]
         if not ranked:
             return [], None
-        strong_keyword = keyword_last or keyword_full
-        if ranked[0][1] < 0.55 and ranked[0][0] != strong_keyword:
+        # 没把握就不发：分数不到 MIN_SCORE 一律不发（不再因为命中了字面关键词就放行）。
+        if ranked[0][1] < MIN_SCORE:
             return ranked, None
         # 本地已经很自信时，直接采用本地结果，不让 LLM 建议改写。
         if ranked[0][1] >= 0.65 and (

@@ -396,5 +396,68 @@ class GroupJoinGreetingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('旧的固定文字', args[2].situation + args[2].facts)
 
 
+class ContextTests(unittest.IsolatedAsyncioTestCase):
+    def bot(self):
+        bot = TaoYaoBot.__new__(TaoYaoBot)
+        bot.config = {'owner_qq': OWNER, 'profile': {'default_timezone': 'America/New_York'}}
+        bot._owner_qq = lambda: OWNER
+        bot.profiles_enabled = True
+        return bot
+
+    def iso(self, hours_ago):
+        from datetime import timezone, timedelta
+        return (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat(timespec='seconds')
+
+    def test_every_message_is_tagged_with_its_exact_date_weekday_and_time_in_the_persons_timezone(self):
+        bot = self.bot()
+        self.assertRegex(bot._time_tag(self.iso(0.01), None), r'^\[\d\d-\d\d 周[一二三四五六日] \d\d:\d\d\] $')   # even a message from seconds ago
+        self.assertRegex(bot._time_tag(self.iso(9), None), r'^\[\d\d-\d\d 周[一二三四五六日] \d\d:\d\d\] $')
+        self.assertRegex(bot._time_tag(self.iso(24 * 400), None), r'^\[\d{4}-\d\d-\d\d 周[一二三四五六日] \d\d:\d\d\] $')   # other years carry the year
+        self.assertEqual(bot._time_tag('不是时间', None), '')                    # bad data never breaks a reply
+        self.assertEqual(bot._time_tag(None, None), '')
+
+    def test_the_tag_uses_the_persons_timezone_and_the_right_weekday(self):
+        bot = self.bot()                                                        # default zone America/New_York
+        tag = bot._time_tag('2026-11-11T04:02:00+00:00', None)                  # Wednesday 04:02 UTC = Tuesday 23:02 in New York
+        self.assertEqual(tag, '[11-10 周二 23:02] ')
+        bot.config['profile']['default_timezone'] = 'Asia/Shanghai'
+        self.assertEqual(bot._time_tag('2026-11-11T04:02:00+00:00', None), '[11-11 周三 12:02] ')
+
+    async def test_a_proactive_message_sees_what_the_person_just_said_about_their_plans(self):
+        bot = self.bot()
+        rows = [{'role': 'assistant', 'content': '今天的棋下到哪儿了，还是在写代码？', 'created_at': self.iso(9.1)},
+                {'role': 'user', 'content': '看小说去了，代码估计大后天才会写了', 'created_at': self.iso(9.0)}]
+        bot.memory = SimpleNamespace(recent=AsyncMock(return_value=rows))
+        block = await bot._recent_chat_block('private', USER, USER, None)
+        self.assertIn('代码估计大后天才会写了', block)
+        self.assertIn('以它为准', block)                                         # plans said in chat beat profile habits
+        self.assertRegex(block, r'\[\d\d-\d\d 周[一二三四五六日] \d\d:\d\d\] 对方：看小说')
+        bot.memory.recent.assert_awaited_with(f'user_private:{USER}', 14)       # that person's own private session only
+
+    async def test_public_drafts_and_unknown_targets_never_get_any_chat(self):
+        bot = self.bot()
+        bot.memory = SimpleNamespace(recent=AsyncMock(return_value=[{'role': 'user', 'content': '私密', 'created_at': self.iso(1)}]))
+        bot.profiles = SimpleNamespace(group_context=AsyncMock(return_value=[]))
+        self.assertEqual(await bot._recent_chat_block('group', 0, None, None), '')   # qzone posts/comments are generated as ('group', 0)
+        self.assertEqual(await bot._recent_chat_block('private', 0, 0, None), '')
+        bot.memory.recent.assert_not_awaited()
+        bot.profiles.group_context.assert_not_awaited()
+
+    async def test_a_group_proactive_message_only_sees_the_last_hour_of_that_group(self):
+        bot = self.bot()
+        bot.profiles = SimpleNamespace(group_context=AsyncMock(return_value=[
+            {'role': 'user', 'content': '刚才聊的', 'nickname': '小明', 'created_at': self.iso(0.2)}]))
+        bot.memory = SimpleNamespace(recent=AsyncMock())
+        block = await bot._recent_chat_block('group', 55, USER, None)
+        self.assertIn('小明：刚才聊的', block)
+        bot.profiles.group_context.assert_awaited_with(55, 10, 3600)
+        bot.memory.recent.assert_not_awaited()
+
+    async def test_a_broken_history_read_does_not_stop_the_message(self):
+        bot = self.bot()
+        bot.memory = SimpleNamespace(recent=AsyncMock(side_effect=RuntimeError('db')))
+        self.assertEqual(await bot._recent_chat_block('private', USER, USER, None), '')
+
+
 if __name__ == '__main__':
     unittest.main()

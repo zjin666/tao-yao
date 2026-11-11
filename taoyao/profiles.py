@@ -163,6 +163,12 @@ class ProfileStore:
                 "status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL)")
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(status, due_at)")
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS plans ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, scene TEXT NOT NULL DEFAULT 'private', "
+                "group_id INTEGER NOT NULL DEFAULT 0, text TEXT NOT NULL, until TEXT NOT NULL, "
+                "hedged INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_plans_user ON plans(user_id, status, until)")
             # 旧版每个群只有一条要求：一次性搬进新表（长期、已生效），搬完清空旧表，不会重复搬。
             self._conn.execute(
                 "INSERT INTO group_requirement_items(group_id, content, kind, status, created_at, confirmed_at) "
@@ -698,14 +704,14 @@ class ProfileStore:
     ) -> list[dict]:
         if scene == "group":
             rows = self._conn.execute(
-                "SELECT role, content, scene, group_id FROM user_messages "
+                "SELECT role, content, scene, group_id, created_at FROM user_messages "
                 "WHERE user_id = ? AND scene = 'group' AND group_id = ? ORDER BY id DESC LIMIT ?",
                 (user_id,int(group_id or 0),limit),
             ).fetchall()
         else:
             # 私聊可以看到自己的群聊记录；群聊不会看到私聊记录。
             rows = self._conn.execute(
-                "SELECT role, content, scene, group_id FROM user_messages "
+                "SELECT role, content, scene, group_id, created_at FROM user_messages "
                 "WHERE user_id = ? AND (scene = 'private' OR scene = 'group') "
                 "ORDER BY id DESC LIMIT ?",
                 (user_id, limit),
@@ -935,6 +941,8 @@ class ProfileStore:
             self._conn.execute("DELETE FROM user_messages_archive WHERE user_id = ?", (user_id,))
             self._conn.execute("DELETE FROM profile_group_summaries WHERE user_id = ?", (user_id,))
             self._conn.execute("DELETE FROM greetings WHERE user_id = ?", (user_id,))
+            self._conn.execute("DELETE FROM reminders WHERE user_id = ?", (user_id,))
+            self._conn.execute("DELETE FROM plans WHERE user_id = ?", (user_id,))
             self._conn.execute("DELETE FROM user_memories WHERE user_id = ?", (user_id,))
             self._conn.execute("DELETE FROM profiles WHERE user_id = ?", (user_id,))
             # group_summaries 是群内所有人共用的，不能因为一个用户退出就删掉。
@@ -1214,6 +1222,50 @@ class ProfileStore:
 
     async def count_reminders(self, user_id) -> int:
         return await self._run(self._count_reminders, str(user_id))
+
+    # ---------- 近期计划记忆（带到期日，过期自动失效） ----------
+
+    def _active_plans(self, user_id: str, scene: str, group_id: int, oldest_until: str) -> list[dict]:
+        """还有效的计划（until 不早于 oldest_until）。私聊的只在私聊用，群里说的只在那个群里用。"""
+        sql = "SELECT * FROM plans WHERE user_id = ? AND status = 'active' AND until >= ? AND scene = ?"
+        args: list = [str(user_id), oldest_until, scene]
+        if scene == "group":
+            sql += " AND group_id = ?"
+            args.append(int(group_id or 0))
+        sql += " ORDER BY until, id"
+        return [dict(r) for r in self._conn.execute(sql, args).fetchall()]
+
+    def _add_plans(self, user_id: str, scene: str, group_id: int, items: list[dict], cancel_ids: list[int],
+                   max_active: int, prune_before: str) -> int:
+        added = 0
+        with self._conn:
+            for rid in cancel_ids:
+                self._conn.execute("UPDATE plans SET status = 'cancelled' WHERE id = ? AND user_id = ?", (int(rid), str(user_id)))
+            for item in items:
+                same = self._conn.execute(
+                    "SELECT 1 FROM plans WHERE user_id = ? AND scene = ? AND group_id = ? AND status = 'active' "
+                    "AND text = ? AND until = ?", (str(user_id), scene, int(group_id or 0), item["text"], item["until"])).fetchone()
+                if same:
+                    continue
+                self._conn.execute(
+                    "INSERT INTO plans(user_id, scene, group_id, text, until, hedged, created_at) VALUES (?,?,?,?,?,?,?)",
+                    (str(user_id), scene, int(group_id or 0), item["text"], item["until"], 1 if item.get("hedged") else 0, _now()))
+                added += 1
+            # 太旧的清掉；每人最多保留最近的 max_active 条
+            self._conn.execute("DELETE FROM plans WHERE until < ?", (prune_before,))
+            self._conn.execute(
+                "UPDATE plans SET status = 'cancelled' WHERE user_id = ? AND status = 'active' AND id NOT IN ("
+                "SELECT id FROM plans WHERE user_id = ? AND status = 'active' ORDER BY id DESC LIMIT ?)",
+                (str(user_id), str(user_id), int(max_active)))
+        return added
+
+    async def active_plans(self, user_id, scene: str, group_id: int, oldest_until: str) -> list[dict]:
+        return await self._run(self._active_plans, str(user_id), scene, int(group_id or 0), oldest_until)
+
+    async def add_plans(self, user_id, scene: str, group_id: int, items: list[dict], cancel_ids: list[int],
+                        max_active: int, prune_before: str) -> int:
+        return await self._run(self._add_plans, str(user_id), scene, int(group_id or 0), items, cancel_ids,
+                               int(max_active), prune_before)
 
     # ---------- 撤回：把这条消息当作没发过 ----------
 

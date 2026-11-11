@@ -139,6 +139,9 @@ DEFAULTS: dict[str, Any] = {
         "max_chars": 500,
         "max_items": 12,
     },
+    "plans": {
+        "enabled": True,
+    },
     "reminders": {
         "enabled": True,
         "max_active": 30,
@@ -234,6 +237,13 @@ DEFAULTS: dict[str, Any] = {
         "enabled": True,
         "dir": "memes",
         "probability": 0.45,
+        "min_interval_seconds": 120,
+        "max_per_window": 6,
+        "window_seconds": 900,
+        "skip_long_chars": 100,
+        "llm_judge": True,
+        "direct_score": 0.9,
+        "judge_min_score": 0.45,
     },
     "user_memes": {
         "enabled": True,

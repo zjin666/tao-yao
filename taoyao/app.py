@@ -45,6 +45,7 @@ from .linkreader import LinkReader, extract_links
 from .videolink import VideoWatcher
 from . import qzone_comments, qzone_proactive
 from . import reminders as reminder_logic
+from . import plans as plan_logic
 from .llm import LLMError, create_llm, llm_request_settings
 from .memes import MemeLibrary
 from .user_memes import UserMemeLibrary
@@ -3770,6 +3771,54 @@ class TaoYaoBot:
         return ReplyIntent('','需要一份公开的QQ空间自我介绍稿，1–2句、160字以内。'
             '仅使用公开人设，不提私聊、owner私人信息、内部机制；不要@、表情操作标签或发消息动作。')
 
+    # ---------- 近期计划记忆 ----------
+
+    async def _plans_block(self, user_id, scene: str, group_id: int, profile: dict | None) -> str:
+        """这个人亲口说过的、还没过期的近期计划，给回复和主动发话的模型看。失败就空，不影响回复。"""
+        if not getattr(self, "profiles_enabled", False) or not user_id:
+            return ""
+        try:
+            tz = self._timezone_for(profile)
+            today = datetime.now(ZoneInfo(tz)).date()
+            oldest = (today - timedelta(days=plan_logic.GRACE_DAYS)).isoformat()
+            plans = await self.profiles.active_plans(user_id, scene, group_id, oldest)
+            return plan_logic.render_block(plans, today, tz)
+        except Exception:
+            log.debug("读取近期计划失败", exc_info=True)
+            return ""
+
+    def _schedule_plan_extraction(self, user_id, scene: str, group_id: int, text: str, profile: dict | None) -> None:
+        """后台抽取：对方这句话里有没有带日期的近期计划。不阻塞回复；失败静默。"""
+        if not getattr(self, "profiles_enabled", False) or not (self.config.get("plans") or {}).get("enabled", True):
+            return
+        value = re.split(r"\n\[(?:最近图片记忆|图片内容|视频内容|表情包内容)", str(text or ""), maxsplit=1)[0].strip()
+        if not plan_logic.worth_extracting(value):
+            return
+        task = asyncio.create_task(self._extract_plans(user_id, scene, group_id, value, profile), context=Context())
+        self._memory_tasks.add(task)
+        task.add_done_callback(self._memory_tasks.discard)
+
+    async def _extract_plans(self, user_id, scene: str, group_id: int, text: str, profile: dict | None) -> None:
+        try:
+            tz = self._timezone_for(profile)
+            now_local = datetime.now(ZoneInfo(tz))
+            today = now_local.date()
+            existing = await self.profiles.active_plans(user_id, scene, group_id, today.isoformat())
+            reply = await getattr(self, "utility_llm", self.llm).chat([
+                {"role": "system", "content": plan_logic.extract_prompt(now_local, tz, plan_logic.describe_existing(existing))},
+                {"role": "user", "content": text}])
+            match = re.search(r"\{.*\}", reply or "", re.S)
+            parsed = json.loads(match.group(0)) if match else {}
+            items = plan_logic.validate(parsed, today)
+            cancel = [existing[n - 1]["id"] for n in plan_logic.cancel_numbers(parsed) if 1 <= n <= len(existing)]
+            if not items and not cancel:
+                return
+            added = await self.profiles.add_plans(user_id, scene, group_id, items, cancel, plan_logic.MAX_ACTIVE,
+                                                  (today - timedelta(days=7)).isoformat())
+            log.info("近期计划：新增 %s 条，取消 %s 条", added, len(cancel))
+        except Exception:
+            log.debug("抽取近期计划失败", exc_info=True)
+
     # ---------- 提醒、定时任务、生日和纪念日 ----------
 
     _REMINDER_HINT = re.compile(
@@ -4793,10 +4842,16 @@ class TaoYaoBot:
             log.exception("匹配表情分类失败")
             return False
         # A valid model semantic decision wins over surface keyword matches.
-        if preferred in self.memes.categories:
+        tagged = preferred in self.memes.categories
+        if tagged:
             chosen = (preferred, 0.95)
+        conversation = f"{target}:{target_id}"
+        if not tagged and not self._meme_allowed(conversation, sentence):
+            return False                       # 桃夭自己没打标签的，要隔开发、内容多的回复不发；打了标签的不受限制
         if random.random() > self._meme_probability(role):
             return False
+        if not tagged:
+            chosen = await self._meme_judge(target, target_id, sentence, candidates, chosen)
 
         user_entry = None
         if random.random() <= self.user_memes.use_probability:
@@ -4820,6 +4875,7 @@ class TaoYaoBot:
                     own_score,
                 )
                 await self._send_image(target, target_id, user_path)
+                self._note_meme_sent(conversation)
                 return True
 
         if not chosen:
@@ -4830,7 +4886,68 @@ class TaoYaoBot:
         if not path:
             return False
         await self._send_image(target, target_id, path)
+        self._note_meme_sent(conversation)
         return True
+
+    async def _meme_judge(self, target: str, target_id: int, sentence: str, candidates, local_choice):
+        """桃夭自己没打标签的表情包：本地语义模型只给候选，真正选哪个、要不要发，让模型结合最近聊天（带具体日期时间）重新判断。
+        很有把握（分数够高）的直接用；候选都不贴切、或这句话是在讲事情、给建议、问问题，就不发。判断失败也不发。"""
+        cfg = self.config.get("memes") or {}
+        if not cfg.get("llm_judge", True):
+            return local_choice
+        if local_choice and local_choice[1] >= float(cfg.get("direct_score", 0.9)):
+            return local_choice
+        floor = float(cfg.get("judge_min_score", 0.45))
+        options = [(cat, score) for cat, score in (candidates or []) if score >= floor][:3]
+        if not options:
+            return None
+        recipient = target_id if target == "private" else None
+        lines = await self._recent_chat_lines(target, target_id, recipient, None, 8)
+        names = [cat for cat, _ in options]
+        others = [cat for cat in self.memes.categories if cat not in names]
+        extra = "；".join(f"{cat}：{re.split('[，。、；,]', str(self.memes.categories.get(cat, '')))[0][:14]}" for cat in others)
+        listing = "\n".join(f"- {cat}：{self.memes.categories.get(cat, cat)}（本地相似度 {score:.2f}）" for cat, score in options)
+        try:
+            reply = await getattr(self, "utility_llm", self.llm).chat([
+                {"role": "system", "content": (
+                    "你是表情包挑选助手。桃夭刚说完下面这段话，要不要配一张表情包、配哪一类，由你结合最近聊天来判断。"
+                    '只输出 JSON：{"category":"候选里的分类名，或 none"}。'
+                    "规则：表情包要表达桃夭这句话此刻真实的情绪或态度，而不是话题里碰巧出现的词；"
+                    "候选都不贴切，或者这句话是在认真讲事情、给建议、回答问题、提问澄清时，一律 none；宁可不发，也别发错。"
+                    "最近聊天每行开头的时间是那条消息发出时的具体日期，可以用来判断话题是不是还在延续。")},
+                {"role": "user", "content": "最近聊天（旧→新）：\n" + ("\n".join(lines) or "（无）")
+                                             + f"\n\n桃夭刚说的话：{sentence[:300]}\n\n候选分类：\n{listing}"
+                                             + (f"\n\n其他分类（候选都不贴切、但这里有明显更贴切的，才选这里的）：{extra}" if extra else "")}])
+            match = re.search(r"\{.*\}", reply or "", re.S)
+            category = str((json.loads(match.group(0)) if match else {}).get("category") or "").strip()
+        except Exception:
+            log.debug("表情复核失败", exc_info=True)
+            return None                                   # 判断不出来就不发
+        if category not in names and category not in others:
+            log.info("表情复核：不发 候选=%s", ",".join(names))
+            return None
+        score = dict(options).get(category, 0.0)
+        log.info("表情复核：选择 %s（本地 %.2f，候选 %s）", category, score, ",".join(names))
+        return (category, max(score, 0.7))
+
+    def _meme_allowed(self, conversation: str, sentence: str) -> bool:
+        """没有桃夭自己的标签时：内容多的回复（攻略、说明）不配表情包；同一个聊天里两次要隔开，15 分钟内也有上限。"""
+        cfg = self.config.get("memes") or {}
+        compact = re.sub(r"\s+", "", sentence or "")
+        if len(compact) > int(cfg.get("skip_long_chars", 100)) or re.search(r"https?://", compact):
+            return False
+        now = time.monotonic()
+        window = float(cfg.get("window_seconds", 900))
+        times = [t for t in self.__dict__.setdefault("_meme_times", {}).get(conversation, []) if now - t < window]
+        if times and now - times[-1] < float(cfg.get("min_interval_seconds", 120)):
+            return False
+        return len(times) < int(cfg.get("max_per_window", 6))
+
+    def _note_meme_sent(self, conversation: str) -> None:
+        """不论有没有标签，发出去的都记下来，这样连发的标签表情也会让后面没标签的往后排。"""
+        store = self.__dict__.setdefault("_meme_times", {})
+        now = time.monotonic()
+        store[conversation] = [t for t in store.get(conversation, []) if now - t < 3600] + [now]
 
     async def _review_reply_boundary(self, reply: str, messages: list[dict[str, str]], policy: dict) -> tuple[str, str]:
         """Complete replies use the same selected checker as streamed sentences."""
@@ -5781,6 +5898,9 @@ class TaoYaoBot:
                 if link_text:
                     text = f"{text}\n\n{link_text}"
 
+        if not ambient:
+            self._schedule_plan_extraction(user_id, "group" if is_group else "private", group_id if is_group else 0,
+                                           raw_text if raw_text is not None else text, profile)
         profile_limit = int((self.config.get("profile") or {}).get("context_messages", 12))
         include_private = False
         reply_inputs = {}
@@ -5796,7 +5916,7 @@ class TaoYaoBot:
                     "group_history_minutes", 60)) * 60) if is_group else 0,
                 # 更早的记录只保留桃夭实际回复过的那段，最远回溯这么久。
                 group_recall_seconds=int(float((self.config.get("reply") or {}).get(
-                    "group_recall_hours", 24)) * 3600) if is_group else 0,
+                    "group_recall_hours", 4)) * 3600) if is_group else 0,
             )
             history = reply_inputs["history"]
         else:
@@ -5836,6 +5956,7 @@ class TaoYaoBot:
         group_summary = reply_inputs.get("group_summary", "")
         user_memory = reply_inputs.get("user_memory", "")
         knowledge_context = await self._knowledge_context(text,role,user_id,is_group)
+        plans_block = await self._plans_block(user_id, "group" if is_group else "private", group_id if is_group else 0, profile)
         group_requirements = "\n".join(f"- {item}" for item in reply_inputs.get("group_requirements", []))
         clock_context = '\n'.join(str(item.get('content') or '') for item in history[-2:])
         time_requested = needs_clock(raw_text or text, clock_context)
@@ -5882,11 +6003,14 @@ class TaoYaoBot:
             )
             system += knowledge_context
             system += held_note
+            system += plans_block
+            system += self.HISTORY_TIME_NOTE
             messages = [{"role": "system", "content": system}]
             for item in history:
                 content = re.sub(
                     r"^\s*\[(群聊|私聊|用户|群友|哥哥)\]\s*", "", str(item["content"] or "")
                 )
+                content = self._time_tag(item.get("created_at"), profile) + content
                 if is_group and item.get("role") == "user":
                     name = item.get("nickname") or "群友"
                     uid = str(item.get("user_id") or "")
@@ -6124,6 +6248,61 @@ class TaoYaoBot:
         self._owner_summary_tasks[session]=task
         self._memory_tasks.add(task);task.add_done_callback(self._memory_tasks.discard)
 
+    HISTORY_TIME_NOTE = (
+        "\n\n【历史时间】对话记录里每行开头方括号里的“11-10 周二 22:50”，是那条消息发出时的具体日期、星期和时间（对方所在时区，"
+        "跨年的带年份）。用它判断谁先谁后、隔了多久，并把“明天/后天/大后天/过几天/周五”这类相对说法换算成具体哪一天"
+        "（以那条消息发出的日期为准，不是以现在为准）；不要把这些时间念出来。"
+        "日期已经过去的计划和话题，除非对方重新提起，不主动再提，也不当成还没发生。")
+
+    _WEEKDAY_NAMES = "一二三四五六日"
+
+    def _time_tag(self, created_at, profile: dict | None) -> str:
+        """每条历史消息的时间标注：具体日期 + 星期 + 时:分（对方所在时区，跨年的带年份）。解析不了就不标。"""
+        try:
+            moment = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            zone = ZoneInfo(self._timezone_for(profile))
+            local, today = moment.astimezone(zone), datetime.now(timezone.utc).astimezone(zone)
+            date = local.strftime("%m-%d") if local.year == today.year else local.strftime("%Y-%m-%d")
+            return f"[{date} 周{self._WEEKDAY_NAMES[local.weekday()]} {local:%H:%M}] "
+        except Exception:
+            return ""
+
+    async def _recent_chat_lines(self, target: str, target_id: int, recipient, profile: dict | None, limit: int = 12) -> list[str]:
+        """同一个聊天里最近的几条（旧→新），每条带具体日期时间。给说说、评论这类公开稿用的（target_id 为 0）不取任何聊天。"""
+        try:
+            if target == "private" and recipient:
+                rows = await self.memory.recent(conversation_session(0, recipient, self._owner_qq()), 14)
+            elif target == "group" and target_id and getattr(self, "profiles_enabled", False):
+                rows = await self.profiles.group_context(int(target_id), 10, 3600)
+            else:
+                return []
+        except Exception:
+            log.debug("读取最近聊天失败", exc_info=True)
+            return []
+        lines = []
+        for item in rows[-limit:]:
+            text = re.sub(r"^\s*\[(群聊|私聊|用户|群友|哥哥)\]\s*", "", str(item.get("content") or ""))
+            text = re.sub(r"\s+", " ", text).strip()[:160]
+            if not text:
+                continue
+            who = "桃夭" if item.get("role") == "assistant" else (item.get("nickname") or "对方")
+            lines.append(f"{self._time_tag(item.get('created_at'), profile)}{who}：{text}")
+        return lines
+
+    async def _recent_chat_block(self, target: str, target_id: int, recipient, profile: dict | None) -> str:
+        """主动发起的话（问候、提醒、功能结果）也要看到最近聊了什么，才能延续话题、不说和对方刚说过的计划矛盾的话。
+        只取同一个聊天里的记录；给说说、评论这类公开稿用的（target_id 为 0）不带任何聊天。"""
+        lines = await self._recent_chat_lines(target, target_id, recipient, profile, 12)
+        plans = await self._plans_block(recipient if target == "private" else recipient or 0,
+                                        "private" if target == "private" else "group", target_id if target == "group" else 0, profile)
+        if not lines:
+            return plans
+        return ("\n\n【最近聊天（旧→新）】\n" + "\n".join(lines) + plans + self.HISTORY_TIME_NOTE +
+                "\n对方在最近聊天里说过的计划、状态和安排（例如“代码后天才写”）以它为准，优先于画像里的习惯和旧印象；"
+                "不要说和它矛盾的话，不要编造对方今天的经历，不重提已经过去的旧话题。")
+
     async def _reply_from_intent(self,target,target_id,intent,*,profile=None,
                                  at_user_id=None,reply_window_key=None) -> bool:
         """Feed functional facts into the same prompt, generation and review path."""
@@ -6145,6 +6324,7 @@ class TaoYaoBot:
                 profile_summary=self._profile_summary(profile,is_group=target=='group',group_id=target_id if target=='group' else 0),
                 tone_hint=self._tone_hint(profile),reply_intent=instruction,review_policy=policy,
                 current_time=self._current_time_text(profile))
+            system+=await self._recent_chat_block(target,target_id,recipient,profile)
             messages=[{'role':'system','content':system},{'role':'user','content':json.dumps({
                 'current_request':intent.source,'confirmed_facts':intent.facts},ensure_ascii=False)}]
             result=await self._stream_reply(messages,target,target_id,4,
