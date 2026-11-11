@@ -125,8 +125,7 @@
     "text": "……你好。我是桃夭。\n平时话不多，但不代表我没在听。\n以后请多关照。……先说好，我可不是对谁都这么客气。"
   },
   "group_join_greeting": {
-    "enabled": true,
-    "text": "大家好，我是桃夭。以后请多关照。"
+    "enabled": true
   },
   "group_ambient": {
     "enabled": true,

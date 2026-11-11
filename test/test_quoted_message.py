@@ -93,3 +93,15 @@ class QuoteScopeTests(unittest.TestCase):
         self.assertTrue(same_quote_scope({'message_type':'private','sender':{'user_id':200}},'private',0,200,100))
         self.assertTrue(same_quote_scope({'message_type':'private','sender':{'user_id':100},'target_id':200},'private',0,200,100))
         self.assertEqual(quote_text('原话[CQ:image,file=secret]。'),'原话。')
+
+
+class QuotedImageTests(unittest.TestCase):
+    def test_bot_memes_are_named_and_other_images_take_the_given_descriptions(self):
+        from taoyao.quoted import quote_images, quote_text
+        meme = {'type': 'image', 'data': {'file': 'file:///D:/tao-yao/memes/food/02_%E5%90%83%E5%9B%A2%E5%AD%90.png'}}
+        photo = {'type': 'image', 'data': {'url': 'https://x/y.jpg'}}
+        message = [{'type': 'text', 'data': {'text': '看'}}, meme, photo]
+        self.assertEqual(quote_images(message), [photo])                    # the bot's own meme needs no recognition
+        self.assertIn('吃团子', quote_text(message))
+        self.assertIn('[图片或表情包]', quote_text(message))               # no description -> placeholder
+        self.assertIn('[图片内容] 一只猫', quote_text(message, ['一只猫']))

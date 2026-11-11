@@ -153,6 +153,16 @@ class ProfileStore:
                 self._conn.execute("ALTER TABLE group_requirement_items ADD COLUMN asked INTEGER NOT NULL DEFAULT 0")
             self._conn.execute(
                 "CREATE TABLE IF NOT EXISTS wait_habits (key TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at TEXT NOT NULL)")
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS reminders ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, scene TEXT NOT NULL DEFAULT 'private', "
+                "group_id INTEGER NOT NULL DEFAULT 0, kind TEXT NOT NULL DEFAULT 'reminder', content TEXT NOT NULL, "
+                "subject TEXT NOT NULL DEFAULT '', repeat TEXT NOT NULL DEFAULT 'none', spec TEXT NOT NULL DEFAULT '{}', "
+                "tz TEXT NOT NULL DEFAULT 'Asia/Shanghai', due_at REAL NOT NULL, lead_days INTEGER NOT NULL DEFAULT 0, "
+                "lead_sent REAL NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, "
+                "status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL)")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(status, due_at)")
             # 旧版每个群只有一条要求：一次性搬进新表（长期、已生效），搬完清空旧表，不会重复搬。
             self._conn.execute(
                 "INSERT INTO group_requirement_items(group_id, content, kind, status, created_at, confirmed_at) "
@@ -1127,6 +1137,108 @@ class ProfileStore:
 
     async def save_wait_habit(self, key: str, data: dict) -> None:
         await self._run(self._save_wait_habit, str(key), data)
+
+    # ---------- 提醒、生日和纪念日 ----------
+
+    def _reminder_row(self, row) -> dict:
+        data = dict(row)
+        try:
+            data["spec"] = json.loads(data.get("spec") or "{}")
+        except ValueError:
+            data["spec"] = {}
+        return data
+
+    def _add_reminder(self, user_id: str, scene: str, group_id: int, item: dict, lead_sent: float) -> int:
+        with self._conn:
+            cursor = self._conn.execute(
+                "INSERT INTO reminders(user_id, scene, group_id, kind, content, subject, repeat, spec, tz, due_at, "
+                "lead_days, lead_sent, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(user_id), scene, int(group_id or 0), item["kind"], item["content"], item.get("subject", ""),
+                 item["repeat"], json.dumps(item["spec"], ensure_ascii=False), item["tz"], float(item["due_at"]),
+                 int(item.get("lead_days") or 0), float(lead_sent), _now()))
+            return int(cursor.lastrowid)
+
+    def _active_reminders(self, user_id: str, scene: str = "", group_id: int = 0) -> list[dict]:
+        sql = "SELECT * FROM reminders WHERE user_id = ? AND status = 'active'"
+        args: list = [str(user_id)]
+        if scene == "group":                      # 群里只看这个群里设的，别人私聊设的（尤其生日）不在群里露出
+            sql += " AND scene = 'group' AND group_id = ?"
+            args.append(int(group_id or 0))
+        sql += " ORDER BY due_at"
+        return [self._reminder_row(r) for r in self._conn.execute(sql, args).fetchall()]
+
+    def _due_reminders(self, now: float) -> list[dict]:
+        """到点的，以及带提前提醒、提前提醒也到点了的。"""
+        rows = self._conn.execute(
+            "SELECT * FROM reminders WHERE status = 'active' AND (due_at <= ? OR "
+            "(lead_days > 0 AND lead_sent != due_at AND due_at - lead_days * 86400 <= ?)) ORDER BY due_at LIMIT 50",
+            (float(now), float(now))).fetchall()
+        return [self._reminder_row(r) for r in rows]
+
+    def _update_reminder(self, reminder_id: int, **fields) -> None:
+        allowed = {"due_at", "lead_sent", "attempts", "status", "spec"}
+        sets, args = [], []
+        for key, value in fields.items():
+            if key in allowed:
+                sets.append(f"{key} = ?")
+                args.append(json.dumps(value, ensure_ascii=False) if key == "spec" else value)
+        if sets:
+            with self._conn:
+                self._conn.execute(f"UPDATE reminders SET {', '.join(sets)} WHERE id = ?", [*args, int(reminder_id)])
+
+    def _cancel_reminder(self, reminder_id: int, user_id: str) -> bool:
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE reminders SET status = 'cancelled' WHERE id = ? AND user_id = ? AND status = 'active'",
+                (int(reminder_id), str(user_id)))
+            return cursor.rowcount > 0
+
+    def _count_reminders(self, user_id: str) -> int:
+        return int(self._conn.execute(
+            "SELECT COUNT(*) FROM reminders WHERE user_id = ? AND status = 'active'", (str(user_id),)).fetchone()[0])
+
+    async def add_reminder(self, user_id, scene: str, group_id: int, item: dict, lead_sent: float = 0.0) -> int:
+        return await self._run(self._add_reminder, str(user_id), scene, int(group_id or 0), item, lead_sent)
+
+    async def active_reminders(self, user_id, scene: str = "", group_id: int = 0) -> list[dict]:
+        return await self._run(self._active_reminders, str(user_id), scene, int(group_id or 0))
+
+    async def due_reminders(self, now: float) -> list[dict]:
+        return await self._run(self._due_reminders, float(now))
+
+    async def update_reminder(self, reminder_id: int, **fields) -> None:
+        await self._run(self._update_reminder, int(reminder_id), **fields)
+
+    async def cancel_reminder(self, reminder_id: int, user_id) -> bool:
+        return await self._run(self._cancel_reminder, int(reminder_id), str(user_id))
+
+    async def count_reminders(self, user_id) -> int:
+        return await self._run(self._count_reminders, str(user_id))
+
+    # ---------- 撤回：把这条消息当作没发过 ----------
+
+    def _remove_message_by_id(self, message_id: str, scene: str, group_id: int, user_id: str) -> list[str]:
+        """按 QQ 消息 id 删掉这条消息（只限定在对应的私聊/群里），返回被删的内容，方便同步清掉别处的副本。"""
+        if scene == "group":
+            where, args = "message_id = ? AND scene = 'group' AND group_id = ?", [str(message_id), int(group_id or 0)]
+        else:
+            where, args = "message_id = ? AND scene = 'private' AND user_id = ?", [str(message_id), str(user_id)]
+        removed = []
+        with self._conn:
+            for table in ("user_messages", "user_messages_archive"):
+                if table == "user_messages_archive" and not self._has_column(table, "message_id"):
+                    continue
+                rows = self._conn.execute(f"SELECT id, content FROM {table} WHERE {where}", args).fetchall()
+                removed += [row["content"] for row in rows]
+                if rows:
+                    self._conn.execute(f"DELETE FROM {table} WHERE {where}", args)
+        return removed
+
+    def _has_column(self, table: str, column: str) -> bool:
+        return any(row[1] == column for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall())
+
+    async def remove_message_by_id(self, message_id: str, scene: str, group_id: int, user_id) -> list[str]:
+        return await self._run(self._remove_message_by_id, str(message_id), scene, int(group_id or 0), str(user_id))
 
     async def get_group_requirements(self, group_id: int) -> list[str]:
         return await self._run(self._get_group_requirements, int(group_id))

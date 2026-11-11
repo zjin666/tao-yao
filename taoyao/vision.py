@@ -19,6 +19,15 @@ from .llm import collect_stream
 log = logging.getLogger("taoyao.vision")
 
 
+IMAGE_PROMPT = (
+    "用中文描述这张图片的内容，并提取图片里出现的文字。要求：先数清画面里一共有几个独立的角色或生物；"
+    "角色身上长出来的耳朵、尾巴、鱼鳍、翅膀、角等属于角色本身，不要当成另一个生物或物品；"
+    "如果某个物体既可能是单独的东西、也可能是角色自己的身体部分（比如从身后绕到身前或被抱着的尾巴），"
+    "两种可能都写出来，不要只选一种；写明角色的动作、表情和姿势；不确定的写“可能”，不要编造；"
+    "控制在 200 字以内，不要用列表和 Markdown 格式。"
+)
+
+
 class MediaDescriber:
     """把图片/视频转成文字：优先视觉 API，没配置时用本地 OCR。"""
 
@@ -342,8 +351,7 @@ class MediaDescriber:
             try:
                 return await self._api_describe(
                     [normalized],
-                    "用中文简洁描述这张图片的内容，并提取图片里出现的文字；"
-                    "不确定的不要编造。",
+                    IMAGE_PROMPT,
                 )
             except Exception as exc:
                 log.warning("视觉 API 失败，退回 OCR：%s", exc)

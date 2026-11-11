@@ -139,11 +139,30 @@ DEFAULTS: dict[str, Any] = {
         "max_chars": 500,
         "max_items": 12,
     },
+    "reminders": {
+        "enabled": True,
+        "max_active": 30,
+        "tick_seconds": 30,
+    },
     "qzone": {
         "enabled": True,
         "post_cooldown_seconds": 120,
         "max_chars": 500,
         "read_limit": 3,
+        "comment_watch": True,
+        "comment_poll_seconds": 600,
+        "comment_max_chars": 200,
+        "reply_confirm": True,
+        "comment_notify": False,
+        "auto_reply": True,
+        "auto_reply_per_hour": 6,
+        "proactive_comment": True,
+        "proactive_poll_seconds": 1800,
+        "proactive_max_age_hours": 24,
+        "proactive_per_hour": 3,
+        "proactive_per_cycle": 2,
+        "proactive_unsure_skip_probability": 0.6,
+        "ask_owner_per_hour": 5,
     },
     "intro": {
         "enabled": True,
@@ -152,7 +171,6 @@ DEFAULTS: dict[str, Any] = {
     },
     "group_join_greeting": {
         "enabled": True,
-        "text": "大家好，我是桃夭。以后请多关照。",
     },
     "group_ambient": {
         "enabled": True,

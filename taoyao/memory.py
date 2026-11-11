@@ -66,6 +66,19 @@ class MemoryStore:
     async def add_message(self, session: str, role: str, content: str) -> None:
         await self._run(self._add_message, session, role, content)
 
+    def _remove_message(self, session: str, role: str, content: str) -> bool:
+        """删掉这个会话里最近一条完全相同的消息（用户撤回了它）。"""
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT id FROM messages WHERE session = ? AND role = ? AND content = ? ORDER BY id DESC LIMIT 1",
+                (session, role, content)).fetchone()
+            if row:
+                self._conn.execute("DELETE FROM messages WHERE id = ?", (row["id"],))
+            return bool(row)
+
+    async def remove_message(self, session: str, role: str, content: str) -> bool:
+        return await self._run(self._remove_message, session, role, content)
+
     def _recent(self, session: str, limit: int) -> list[dict[str, Any]]:
         rows = self._conn.execute(
             "SELECT role, content, created_at FROM messages "
