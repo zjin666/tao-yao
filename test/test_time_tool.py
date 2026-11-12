@@ -120,7 +120,7 @@ class TimeToolIntegrationTests(unittest.IsolatedAsyncioTestCase):
             bot._maybe_send_reply_poke=AsyncMock()
             bot.server.send_text=AsyncMock(return_value={'status':'ok'})
             try:
-                for n,text in enumerate(('今天好累','现在几点了','还记得我这边是几点吗')):
+                for n,text in enumerate(('我养了一只猫','现在几点了','还记得我这边是几点吗')):
                     await bot._handle_text('private',900001,'user_private:900001',900001,'测试用户',text,'user',False,0,'private',from_batch=True,message_id=str(n))
                     self.assertEqual(bot._current_time_text.call_count,n)
                 self.assertNotIn('【当前时间】',calls[0][0]['content'])
