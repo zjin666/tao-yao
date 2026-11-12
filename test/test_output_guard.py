@@ -23,6 +23,19 @@ class OutputGuardTests(unittest.TestCase):
                      '接口调用失败：先检查你传入的参数。', '系统报错：可能是文件不存在。'):
             self.assertEqual(guard_outgoing(text), text)
 
+    def test_sticker_memory_notes_never_reach_the_user(self):
+        for text in (
+            '（内部参考，不要向对方提起：这张表情已经认识，不要当成第一次见到）',
+            '好呀。（内部参考，不要向对方提起：发送者说明过它的意思：表达开心的心情）',
+            '形象：灰色圆脸猫；可能想表达：委屈',
+            '发送者之前说明过的表情含义（灰褐色头发的角色…→表达开心的心情）',
+        ):
+            self.assertEqual(guard_outgoing(text), '', text)
+        self.assertEqual(internal_notice_reason('（内部参考，不要向对方提起：x）'), 'internal_prompt_or_routing')
+        # 正常聊到表情包不受影响
+        for text in ('这张猫猫表情我认识，委屈巴巴的呀。', '哥哥说这个是开心的意思，我记下啦。'):
+            self.assertEqual(guard_outgoing(text), text)
+
     def test_envelopes_are_removed_without_allowing_secrets_or_malformed_json(self):
         self.assertEqual(guard_outgoing('assistant: 你刚才说到哪了？'),'你刚才说到哪了？')
         self.assertEqual(guard_outgoing('assistant: [消息对象 {"state":"self","nested":{"a":1}}] 接着说吧。'),'接着说吧。')

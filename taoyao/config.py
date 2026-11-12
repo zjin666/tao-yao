@@ -245,6 +245,13 @@ DEFAULTS: dict[str, Any] = {
         "direct_score": 0.9,
         "judge_min_score": 0.45,
     },
+    "sticker_memory": {
+        "enabled": True,
+        "db": "data/stickers.db",
+        "max_per_scope": 200,
+        "near_distance": 6,
+        "pending_seconds": 600,
+    },
     "user_memes": {
         "enabled": True,
         "dir": "user_memes",
@@ -319,6 +326,7 @@ def load_config(path: str | Path | None = None) -> dict:
         ("impressions", "db"),
         ("memes", "dir"),
         ("user_memes", "dir"),
+        ("sticker_memory", "db"),
         ("profile", "db"),
         ("profile", "embedding_model"),
         ("language_analysis", "directory"),

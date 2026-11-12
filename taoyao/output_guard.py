@@ -67,6 +67,8 @@ _INTERNAL_NOTICE = re.compile(
     r"(?:^|\n)\s*(?:ERROR|WARNING|INFO)\s+(?:taoyao|httpx|websockets)\b|"
     r"(?:^|\n)\s*\d{4}-\d\d-\d\d\s+\d\d:\d\d:\d\d[,\.]\d+\s+(?:ERROR|WARNING|INFO)\b|"
     r"【(?:本轮群聊收束|称呼身份准则|当前对话对象|六维的具体表达方向|联网搜索结果|当前用户画像|系统提示|内部状态|回复执行流程|步骤[一二三四五]：[^】]+)】|"
+    r"内部参考[，,]\s*不要向对方提起|这张表情已经认识|发送者(?:之前)?说明过(?:的表情含义|它的意思)|"
+    r"形象[:：][^；\n]{0,24}[；;]\s*可能想表达[:：]|"
     r"\[消息对象\s*\{|这是内部检索状态|此为内部状态|搜索暂时失败，尚未核实|没有查到可用搜索结果，未确认|"
     r"(?:^|\n)\s*(?:system|developer|assistant|tool|analysis)\s*[:：]\s*|"
     r"(?:^|\n)\s*(?:给模型的指令|给助手的指令|仅供模型阅读|内部备注|思考过程)\s*[:：]",
@@ -85,7 +87,7 @@ def internal_notice_reason(text: str) -> str:
         return ''
     if re.search(r'Authorization\s*:|\bsk-[A-Za-z0-9]{20,}', text, re.I):
         return 'credential'
-    if '【' in text or '[消息对象' in text or '内部状态' in text or '内部检索' in text:
+    if '【' in text or '[消息对象' in text or '内部状态' in text or '内部检索' in text or '内部参考' in text:
         return 'internal_prompt_or_routing'
     if re.search(r'^\s*(system|developer|assistant|tool)\s*:', text, re.I|re.M):
         return 'role_prefix'

@@ -190,6 +190,13 @@
     "dir": "memes",
     "probability": 0.35
   },
+  "sticker_memory": {
+    "enabled": true,
+    "db": "data/stickers.db",
+    "max_per_scope": 200,
+    "near_distance": 6,
+    "pending_seconds": 600
+  },
   "user_memes": {
     "enabled": true,
     "dir": "user_memes",

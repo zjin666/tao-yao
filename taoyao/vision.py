@@ -24,7 +24,26 @@ IMAGE_PROMPT = (
     "角色身上长出来的耳朵、尾巴、鱼鳍、翅膀、角等属于角色本身，不要当成另一个生物或物品；"
     "如果某个物体既可能是单独的东西、也可能是角色自己的身体部分（比如从身后绕到身前或被抱着的尾巴），"
     "两种可能都写出来，不要只选一种；写明角色的动作、表情和姿势；不确定的写“可能”，不要编造；"
-    "控制在 200 字以内，不要用列表和 Markdown 格式。"
+    "控制在 160 字以内，不要用列表和 Markdown 格式。"
+)
+
+# 第一次见到的表情包：不复述画面，猜它想表达什么；形象只留一小句，供以后认出同一个角色。
+STICKER_PROMPT = (
+    "这是聊天里发的表情包。不要描述画面细节（发型、衣服、颜色、姿势、背景）。"
+    "按“形象：……；可能想表达：……；文字：……”写一行中文："
+    "形象只用 12 字以内点明是什么角色或形象，方便下次认出；"
+    "可能想表达写发图的人用它最可能想说的意思、情绪或语气（如开心、委屈、无语、撒娇、嘲讽、求饶、认输），"
+    "拿不准给一到两种猜想，用“可能”，不要编造出处或梗名；"
+    "图里有文字就原样写在“文字”里，没有就省略这一项。控制在 80 字以内，不要用列表和 Markdown 格式。"
+)
+
+# 普通图片先让模型判断是不是表情包：是就按表情包写，并以这个标记开头；不是就照常描述。
+STICKER_TAG = "表情包|"
+CLASSIFY_PROMPT = (
+    "先判断这张图是不是聊天里用来表达情绪或语气的表情包（卡通、动漫、梗图、贴纸、表情类的图），"
+    "而不是照片、截图、作品图、信息图或有实际内容的图片。"
+    f"如果是表情包，输出必须以“{STICKER_TAG}”开头，后面按这个要求写：{STICKER_PROMPT}"
+    "如果不是表情包，不要写这个开头，按下面的要求描述：" + IMAGE_PROMPT
 )
 
 
@@ -304,15 +323,33 @@ class MediaDescriber:
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
         }
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            data = await collect_stream(client,
-                f"{self.api_base}/chat/completions", headers, payload)
-            content = str(data["choices"][0]["message"].get("content") or "").strip()
-            if not content:
-                log.warning("视觉 API 返回空正文，finish_reason=%s", data["choices"][0].get("finish_reason"))
-            return content
+        for attempt in (1, 2):
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    data = await collect_stream(client,
+                        f"{self.api_base}/chat/completions", headers, payload)
+                    content = str(data["choices"][0]["message"].get("content") or "").strip()
+                    if not content:
+                        log.warning("视觉 API 返回空正文，finish_reason=%s", data["choices"][0].get("finish_reason"))
+                    return content
+            except Exception as exc:
+                if attempt == 2 or not self._retryable(exc):
+                    raise
+                log.info("视觉 API 临时失败，重试一次：%s", exc)
+                await asyncio.sleep(0.3)
+        return ""
 
-    async def describe(self, path: Path, kind: str) -> str:
+    @staticmethod
+    def _retryable(exc: Exception) -> bool:
+        """只重试流中断、连接类错误和 429/5xx；超时与其他 4xx 不重试，免得白等一轮。"""
+        if isinstance(exc, httpx.TimeoutException):
+            return False
+        if isinstance(exc, httpx.HTTPStatusError):
+            code = exc.response.status_code
+            return code == 429 or code >= 500
+        return isinstance(exc, (httpx.TransportError, ValueError))
+
+    async def describe(self, path: Path, kind: str, context: str = "") -> str:
         if not self.enabled or not path.exists():
             return ""
         if kind == "video":
@@ -351,7 +388,8 @@ class MediaDescriber:
             try:
                 return await self._api_describe(
                     [normalized],
-                    IMAGE_PROMPT,
+                    self._sticker_prompt(context, classify=(kind == "image_or_sticker"))
+                    if kind in ("sticker", "image_or_sticker") else IMAGE_PROMPT,
                 )
             except Exception as exc:
                 log.warning("视觉 API 失败，退回 OCR：%s", exc)
@@ -362,6 +400,15 @@ class MediaDescriber:
                     except OSError:
                         pass
         return await asyncio.to_thread(self._ocr_image, path)
+
+    @staticmethod
+    def _sticker_prompt(context: str, classify: bool = False) -> str:
+        base = CLASSIFY_PROMPT if classify else STICKER_PROMPT
+        context = re.sub(r"\s+", " ", context or "").strip()[:60]
+        if not context:
+            return base
+        return (base + f"紧挨着这张表情的上一句聊天是“{context}”，只用来判断语气和意图，"
+                "不要复述，也不要因此编造画面里没有的内容。")
 
     async def describe_frames(self, frames: list[Path], prompt: str) -> str:
         """把已经截好的几帧交给视觉模型；没配置视觉 API 时返回空。"""
