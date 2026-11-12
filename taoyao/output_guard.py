@@ -5,6 +5,9 @@ import re
 NATURAL_RETRY = "……刚才没接上，你再发一次吧。"
 
 
+HISTORY_TIME_TAG = re.compile(r'^\s*[\[【]\s*(?:\d{4}-)?\d{1,2}-\d{1,2}(?:\s*周[一二三四五六日])?\s+\d{1,2}:\d{2}\s*[\]】]\s*')
+
+
 def _clean_prefix(text: str) -> str:
     """Remove presentation wrappers only; retain malformed/other internal blocks for rejection."""
     text = text or ""
@@ -22,6 +25,8 @@ def _clean_prefix(text: str) -> str:
                     text = tail.lstrip()[1:].lstrip()
             except ValueError:
                 pass
+        # 历史记录每行开头带的“[11-10 周二 22:50]”只是给模型看的时间标注，模型照着学会写在自己回复开头时要去掉。
+        text = HISTORY_TIME_TAG.sub('', text, count=1)
         if previous == text:
             break
     return text

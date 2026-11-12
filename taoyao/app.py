@@ -5959,7 +5959,12 @@ class TaoYaoBot:
         plans_block = await self._plans_block(user_id, "group" if is_group else "private", group_id if is_group else 0, profile)
         group_requirements = "\n".join(f"- {item}" for item in reply_inputs.get("group_requirements", []))
         clock_context = '\n'.join(str(item.get('content') or '') for item in history[-2:])
-        time_requested = needs_clock(raw_text or text, clock_context)
+        # 对方的话里只要涉及时间（早晚问候、今天明天、几点、周几、睡觉吃饭这类），就取当前时间，免得把“晚上好”接成“你们那边还是早上”。
+        time_requested = needs_clock(raw_text or text, clock_context) or bool(
+            re.search(r"早上|早安|早呀|早啊|上午|中午|午安|下午|傍晚|晚上|晚好|晚安|夜安|夜里|半夜|凌晨|深夜|"
+                      r"今天|明天|后天|昨天|前天|今晚|明早|明晚|昨晚|周[一二三四五六日末]|星期|礼拜|"
+                      r"\d{1,2}\s*[点:：时]|几点|点钟|现在|刚刚|刚才|等会|待会|一会儿|马上|这会儿|"
+                      r"起床|睡觉|睡了|熬夜|通宵|上班|下班|放学|吃饭|午饭|晚饭|早饭|早餐|午餐|晚餐|时差|几号|日期|时间", raw_text or text or ""))
         reply_time = self._current_time_text(profile, target_zone=requested_zone(raw_text or text)) if time_requested else ''
         if time_requested:
             log.info('本地时间工具：按需获取，时区=%s', requested_zone(raw_text or text) or self._timezone_for(profile))
@@ -6251,7 +6256,7 @@ class TaoYaoBot:
     HISTORY_TIME_NOTE = (
         "\n\n【历史时间】对话记录里每行开头方括号里的“11-10 周二 22:50”，是那条消息发出时的具体日期、星期和时间（对方所在时区，"
         "跨年的带年份）。用它判断谁先谁后、隔了多久，并把“明天/后天/大后天/过几天/周五”这类相对说法换算成具体哪一天"
-        "（以那条消息发出的日期为准，不是以现在为准）；不要把这些时间念出来。"
+        "（以那条消息发出的日期为准，不是以现在为准）；不要把这些时间念出来，更不要在自己的回复开头照着写这样的方括号时间。"
         "日期已经过去的计划和话题，除非对方重新提起，不主动再提，也不当成还没发生。")
 
     _WEEKDAY_NAMES = "一二三四五六日"
