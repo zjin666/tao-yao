@@ -203,9 +203,11 @@ class StickerContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.vision.describe.await_args.args[1], "image_or_sticker")
         self.assertIn("形象：灰褐卷发角色；可能想表达：开心", first)
         self.assertNotIn("表情包|", first)                  # 分类标记不进入文本
+        self.assertTrue(first.startswith("[表情包内容]"))      # 以图片发来也按表情包标注，回复时当表情接
         self.assertEqual(bot.sticker_memory.take_pending("private:7", 7, "代表我很开心"), 1)
-        await bot._media_text(data)
+        again = await bot._media_text(data)
         self.assertEqual(bot.vision.describe.await_count, 1)   # 第二次直接认出，不再识图
+        self.assertTrue(again.startswith("[表情包内容]"))
 
     async def test_echoed_prompt_opening_is_not_stored(self):
         bot = self.make_bot()
@@ -234,9 +236,24 @@ class StickerContextTests(unittest.IsolatedAsyncioTestCase):
         data = {"message_type": "private", "user_id": 7, "message": [{"type": "image", "data": {}}]}
         text = await bot._media_text(data)
         self.assertIn("傍晚的街道照片", text)
+        self.assertTrue(text.startswith("[图片内容]"))
         self.assertEqual(bot.sticker_memory.take_pending("private:7", 7, "这是我拍的"), 0)
         count = bot.sticker_memory._conn.execute("SELECT COUNT(*) FROM stickers").fetchone()[0]
         self.assertEqual(count, 0)
+
+    async def test_stated_meaning_replaces_only_the_guess_and_keeps_expression_and_text(self):
+        bot = self.make_bot()
+        bot.vision.describe = AsyncMock(
+            return_value="形象：灰色圆脸猫；神态：眼含泪、双手捂脸；可能想表达：委屈；文字：呜呜")
+        data = {"message_type": "private", "user_id": 7, "message": [{"type": "mface", "data": {}}]}
+        await bot._media_text(data)
+        bot.sticker_memory.set_meaning(1, 7, "表达开心的心情", "只是表达我开心")
+        text = await bot._media_text(data)
+        self.assertIn("形象：灰色圆脸猫", text)
+        self.assertIn("神态：眼含泪、双手捂脸", text)
+        self.assertIn("文字：呜呜", text)
+        self.assertNotIn("委屈", text)
+        self.assertIn("表达开心的心情", text)
 
     async def test_stated_meaning_is_not_overwritten_by_guess_refinement(self):
         bot = self.make_bot()
@@ -258,13 +275,15 @@ class StickerPromptTests(unittest.TestCase):
     def test_sticker_prompt_asks_for_meaning_not_appearance(self):
         from taoyao.vision import IMAGE_PROMPT, STICKER_PROMPT
         self.assertIn("可能想表达", STICKER_PROMPT)
-        self.assertIn("不要描述画面细节", STICKER_PROMPT)
+        self.assertIn("神态", STICKER_PROMPT)                     # 以图里的神态、动作、文字为主要依据
+        self.assertIn("不要罗列发型、衣服、颜色、背景", STICKER_PROMPT)
         self.assertNotIn("可能想表达", IMAGE_PROMPT)
         from taoyao.vision import CLASSIFY_PROMPT, STICKER_TAG, MediaDescriber
         self.assertIn(STICKER_TAG, CLASSIFY_PROMPT)
         self.assertIn("照片、截图", CLASSIFY_PROMPT)
         self.assertIn(IMAGE_PROMPT, CLASSIFY_PROMPT)               # 不是表情包时按原要求描述
         self.assertIn("上一句聊天是“在吗”", MediaDescriber._sticker_prompt("在吗", classify=True))
+        self.assertIn("两者冲突时相信图片", MediaDescriber._sticker_prompt("在吗"))   # 上一句只作辅助
 
 
 class MediaTextIntegrationTests(unittest.IsolatedAsyncioTestCase):

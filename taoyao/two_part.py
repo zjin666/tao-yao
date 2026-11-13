@@ -117,16 +117,59 @@ def merge_overflow(text):
     return re.sub(r'^，|，$','',merged)
 
 
+_PAIRS={'「':'」','『':'』','“':'”','（':'）','(':')','[':']','【':'】','{':'}'}
+
+
+def split_clauses(sentence,target=24,ceiling=32,minimum=7):
+    """Cut one long, already-approved sentence at commas into short bubbles, one idea each.
+
+    Never cuts inside quotes/brackets. Clauses are packed up to `target` characters; a
+    leftover shorter than `minimum` joins a neighbour (up to `ceiling`) instead of becoming
+    a tiny bubble. The comma at each cut is dropped; the text itself is not changed."""
+    sentence=sentence.strip()
+    if len(sentence)<=target:return [sentence]
+    clauses=[];current=[];stack=[]
+    for char in sentence:
+        if char in _PAIRS:stack.append(_PAIRS[char])
+        elif stack and char==stack[-1]:stack.pop()
+        if char in '，,；;' and not stack:
+            clause=''.join(current).strip()
+            if clause:clauses.append(clause)
+            current=[]
+        else:current.append(char)
+    tail=''.join(current).strip()
+    if tail:clauses.append(tail)
+    if len(clauses)<2:return [sentence]
+    chunks=[]
+    for clause in clauses:
+        if chunks and len(chunks[-1])+1+len(clause)<=target:chunks[-1]+='，'+clause
+        else:chunks.append(clause)
+    index=0
+    while index<len(chunks) and len(chunks)>1:
+        if len(chunks[index])<minimum:
+            if index+1<len(chunks) and len(chunks[index])+1+len(chunks[index+1])<=ceiling:
+                chunks[index]+='，'+chunks.pop(index+1);continue
+            if index>0 and len(chunks[index-1])+1+len(chunks[index])<=ceiling:
+                chunks[index-1]+='，'+chunks.pop(index);index-=1;continue
+        index+=1
+    return chunks
+
+
 def split_approved_bubbles(text,limit):
-    """Split already-approved text locally; overflow joins the last bubble as one clean run."""
-    parts=[];remaining=text.strip();limit=max(1,int(limit))
-    while remaining and len(parts)<limit-1:
+    """Split already-approved text locally into one idea per bubble; overflow joins the last bubble
+    as one clean run. Sentences first, then long sentences at their commas."""
+    limit=max(1,int(limit));remaining=text.strip();sentences=[]
+    while remaining:
         part,rest=first_sentence(remaining)
-        if part is None:break
-        if part.strip():parts.append(part.strip())
+        if part is None:
+            sentences.append(remaining.strip());break
+        if part.strip():sentences.append(part.strip())
         remaining=rest.strip()
-    if remaining:parts.append(merge_overflow(remaining))
-    return parts
+    atoms=[]
+    for sentence in sentences:atoms.extend(split_clauses(sentence))
+    if len(atoms)<=limit:
+        return atoms[:-1]+[merge_overflow(atoms[-1])] if atoms else []
+    return atoms[:limit-1]+[merge_overflow('，'.join(atoms[limit-1:]))]
 
 
 @dataclass

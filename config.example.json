@@ -179,7 +179,7 @@
   "reply": {
     "segment": true,
     "max_chars": 70,
-    "max_segments": 4,
+    "max_segments": 6,
     "context_messages": 16,
     "polish_fixed": true,
     "segment_gap_min_seconds": 1.0,
@@ -189,6 +189,13 @@
     "enabled": true,
     "dir": "memes",
     "probability": 0.35
+  },
+  "voice": {
+    "enabled": true,
+    "model_dir": "models/sensevoice",
+    "max_seconds": 60,
+    "num_threads": 4,
+    "language": "auto"
   },
   "sticker_memory": {
     "enabled": true,
@@ -247,6 +254,8 @@
   "response_speed": {
     "speculative_reply": true,
     "defer_six_axis": true,
+    "six_axis_settle_seconds": 4.0,
+    "six_axis_max_wait_seconds": 15.0,
     "fast_helpers": true,
     "utility_model": "deepseek-flash",
     "utility_max_tokens": 220,

@@ -71,6 +71,7 @@ class NicknameSourceHandlerTests(unittest.IsolatedAsyncioTestCase):
                 bot.profiles.get=AsyncMock(wraps=bot.profiles.get)
                 await asyncio.wait_for(bot._handle_text('private',900001,'owner_private:900001',900001,
                     '测试owner','A让你记住B以后要叫你小夭','owner',False,0,'private',from_batch=True,message_id='nickname'),5)
+                await asyncio.wait_for(bot._six_axis.flush(),5)   # 六维更新排队后台做，等它做完再检查
                 bot._memory_request_text.assert_not_called()
                 bot._schedule_memory_update.assert_not_called()
                 system=seen[-1][0]['content']

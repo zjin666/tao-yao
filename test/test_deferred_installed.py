@@ -30,11 +30,12 @@ class InstalledDeferredTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(clearly_daily_message(value))
         self.assertFalse(clearly_daily_message('我有点累了', 'user：这句台词是什么出处'))
 
-    async def test_two_turns_use_previous_scores_and_update_only_after_delivery(self):
+    async def test_burst_turns_do_not_wait_and_share_one_merged_update_after_delivery(self):
         with tempfile.TemporaryDirectory() as directory:
             config = load_config()
             config['response_speed']['two_part_reply'] = False
-            config['response_speed'].update(speculative_reply=True, defer_six_axis=True)
+            config['response_speed'].update(speculative_reply=True, defer_six_axis=True,
+                                            six_axis_settle_seconds=0.3, six_axis_max_wait_seconds=5)
             config['memory']['db'] = str(Path(directory)/'memory.db')
             config['profile'].update(db=str(Path(directory)/'profiles.db'), llm_extract=False)
             config['memes']['enabled'] = config['user_memes']['enabled'] = False
@@ -48,7 +49,7 @@ class InstalledDeferredTests(unittest.IsolatedAsyncioTestCase):
                 await bot.profiles.ensure(900001, '测试用户', 'user')
                 scores = dict.fromkeys(DIMENSIONS, 50.)
                 await bot.profiles.update_scores(900001, scores, describe_scores(scores))
-                generations, order = [], []
+                generations, order, analyzed = [], [], []
                 analysis_started, release = asyncio.Event(), asyncio.Event()
                 async def stream(messages):
                     generations.append(messages)
@@ -59,6 +60,7 @@ class InstalledDeferredTests(unittest.IsolatedAsyncioTestCase):
                 labels['HUM'] = ClassificationResult('轻松玩笑', .9)
                 async def analyze(**kwargs):
                     order.append('analysis')
+                    analyzed.append(kwargs['text'])
                     analysis_started.set()
                     await release.wait()
                     return labels, 'TEST'
@@ -71,21 +73,25 @@ class InstalledDeferredTests(unittest.IsolatedAsyncioTestCase):
                     order.append('sent')
                     return {'status': 'ok'}
                 bot.server.send_text = AsyncMock(side_effect=send)
-                async def turn(session, mid):
+                async def turn(session, mid, text):
                     await bot._handle_text('private', 900001, session, 900001, '测试用户',
-                        '我有点累了', 'user', False, 0, 'private', from_batch=True, message_id=mid)
-                one = asyncio.create_task(turn('user_private:900001', 'ONE'))
-                await asyncio.wait_for(analysis_started.wait(), 5)
-                self.assertEqual(order, ['sent', 'analysis'])
-                self.assertIn('HUM 50.0', generations[0][0]['content'])
-                two = asyncio.create_task(turn('another_session:900001', 'TWO'))
-                await asyncio.sleep(0)
-                self.assertEqual(len(generations), 1)
-                release.set()
-                await asyncio.wait_for(asyncio.gather(one, two), 10)
-                self.assertEqual(order, ['sent', 'analysis', 'sent', 'analysis'])
+                        text, 'user', False, 0, 'private', from_batch=True, message_id=mid)
+                await asyncio.wait_for(turn('user_private:900001', 'ONE', '我有点累了'), 5)
+                await asyncio.wait_for(turn('another_session:900001', 'TWO', '今天作业好多'), 5)
+                # 两条回复都已发出，六维更新还没开始：后面的消息不等它。
+                self.assertEqual(order, ['sent', 'sent'])
                 self.assertEqual(len(generations), 2)
-                self.assertNotIn('HUM 50.0', generations[1][0]['content'])
+                self.assertIn('HUM 50.0', generations[0][0]['content'])
+                self.assertIn('HUM 50.0', generations[1][0]['content'])     # 本轮用更新前画像
+                await asyncio.wait_for(analysis_started.wait(), 5)
+                release.set()
+                await asyncio.wait_for(bot._six_axis.flush(), 10)
+                self.assertEqual(order, ['sent', 'sent', 'analysis'])         # 一段连续消息只更新一次
+                self.assertEqual(len(analyzed), 1)
+                self.assertIn('我有点累了', analyzed[0])
+                self.assertIn('今天作业好多', analyzed[0])
+                self.assertNotIn('HUM 50.0', observable_tone(await bot.profiles.get(900001)))   # 更新确实写入
             finally:
+                await bot._six_axis.flush()
                 bot.memory.close()
                 bot.profiles.close()
