@@ -180,6 +180,7 @@
     "segment": true,
     "max_chars": 70,
     "max_segments": 6,
+    "group_max_segments": 5,
     "context_messages": 16,
     "polish_fixed": true,
     "segment_gap_min_seconds": 1.0,

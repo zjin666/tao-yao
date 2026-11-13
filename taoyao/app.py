@@ -2054,10 +2054,14 @@ class TaoYaoBot:
                     log.info("批次被频率限制：%s", first.user_id)
                     await self._send_segments(first.target, first.target_id, "慢一点，我还在看前面的")
                     continue
-                for item in batch:
+                for index, item in enumerate(batch):
                     lock = self._locks.setdefault(item.session, asyncio.Lock())
                     async with lock:
                         self._log_dispatch_timing(item)
+                        # 群里同一个人后面还有消息在排队：这条只记录，由最后一条一起回应，不白白生成一份会被丢掉的回复。
+                        later = batch[index + 1:] + (self._queues.get(key) or [])
+                        superseded = bool(item.is_group and any(
+                            other.is_group and other.user_id == item.user_id for other in later))
                         await self._handle_text(
                             item.target, item.target_id, item.session, item.user_id, item.nickname,
                             item.text, item.role, item.is_group, item.group_id, item.scene,
@@ -2067,6 +2071,7 @@ class TaoYaoBot:
                             media_present=item.media_present,
                             group_familiarity=item.group_familiarity,
                             quote_context=item.quote_context,
+                            superseded=superseded,
                         )
                 if not (self._queues.get(key) or []):
                     break
@@ -5090,6 +5095,11 @@ class TaoYaoBot:
     ) -> bool:
         if not self.config["memes"].get("enabled") or not sentence:
             return False
+        conversation = f"{target}:{target_id}"
+        tired = self._tired_meme_categories(conversation)
+        if preferred in tired:
+            log.info("表情分类 %s 最近用得太多，这次不沿用模型标的分类", preferred)
+            preferred = None
         try:
             candidates, chosen = await asyncio.to_thread(
                 self.memes.match_candidates, sentence, preferred
@@ -5097,17 +5107,22 @@ class TaoYaoBot:
         except Exception:
             log.exception("匹配表情分类失败")
             return False
+        if tired:
+            # 最近用腻的分类先放一边：换本地语义里下一个够格的，没有就不发。
+            candidates = [(cat, score) for cat, score in (candidates or []) if cat not in tired]
+            if chosen and chosen[0] in tired:
+                chosen = candidates[0] if candidates and candidates[0][1] >= float(
+                    (self.config.get("memes") or {}).get("judge_min_score", 0.45)) else None
         # A valid model semantic decision wins over surface keyword matches.
         tagged = preferred in self.memes.categories
         if tagged:
             chosen = (preferred, 0.95)
-        conversation = f"{target}:{target_id}"
         if not tagged and not self._meme_allowed(conversation, sentence):
             return False                       # 桃夭自己没打标签的，要隔开发、内容多的回复不发；打了标签的不受限制
         if random.random() > self._meme_probability(role):
             return False
         if not tagged:
-            chosen = await self._meme_judge(target, target_id, sentence, candidates, chosen)
+            chosen = await self._meme_judge(target, target_id, sentence, candidates, chosen, avoid=tired)
 
         user_entry = None
         if random.random() <= self.user_memes.use_probability:
@@ -5142,10 +5157,10 @@ class TaoYaoBot:
         if not path:
             return False
         await self._send_image(target, target_id, path)
-        self._note_meme_sent(conversation)
+        self._note_meme_sent(conversation, chosen[0])
         return True
 
-    async def _meme_judge(self, target: str, target_id: int, sentence: str, candidates, local_choice):
+    async def _meme_judge(self, target: str, target_id: int, sentence: str, candidates, local_choice, avoid=frozenset()):
         """桃夭自己没打标签的表情包：本地语义模型只给候选，真正选哪个、要不要发，让模型结合最近聊天（带具体日期时间）重新判断。
         很有把握（分数够高）的直接用；候选都不贴切、或这句话是在讲事情、给建议、问问题，就不发。判断失败也不发。"""
         cfg = self.config.get("memes") or {}
@@ -5160,7 +5175,7 @@ class TaoYaoBot:
         recipient = target_id if target == "private" else None
         lines = await self._recent_chat_lines(target, target_id, recipient, None, 8)
         names = [cat for cat, _ in options]
-        others = [cat for cat in self.memes.categories if cat not in names]
+        others = [cat for cat in self.memes.categories if cat not in names and cat not in avoid]
         extra = "；".join(f"{cat}：{re.split('[，。、；,]', str(self.memes.categories.get(cat, '')))[0][:14]}" for cat in others)
         listing = "\n".join(f"- {cat}：{self.memes.categories.get(cat, cat)}（本地相似度 {score:.2f}）" for cat, score in options)
         try:
@@ -5199,11 +5214,20 @@ class TaoYaoBot:
             return False
         return len(times) < int(cfg.get("max_per_window", 6))
 
-    def _note_meme_sent(self, conversation: str) -> None:
+    def _note_meme_sent(self, conversation: str, category: str | None = None) -> None:
         """不论有没有标签，发出去的都记下来，这样连发的标签表情也会让后面没标签的往后排。"""
         store = self.__dict__.setdefault("_meme_times", {})
         now = time.monotonic()
         store[conversation] = [t for t in store.get(conversation, []) if now - t < 3600] + [now]
+        if category:
+            recent = self.__dict__.setdefault("_meme_recent_categories", {})
+            recent[conversation] = (recent.get(conversation, []) + [category])[-4:]
+
+    def _tired_meme_categories(self, conversation: str) -> set[str]:
+        """这个聊天里最近发的 4 个表情中，出现 2 次以上的分类：先放一边，避免总是同一类。"""
+        recent = self.__dict__.get("_meme_recent_categories", {}).get(conversation, [])
+        return {cat for cat in set(recent) if recent.count(cat) >= int(
+            (self.config.get("memes") or {}).get("tired_after", 2))}
 
     async def _review_reply_boundary(self, reply: str, messages: list[dict[str, str]], policy: dict) -> tuple[str, str]:
         """Complete replies use the same selected checker as streamed sentences."""
@@ -5808,6 +5832,7 @@ class TaoYaoBot:
         quote_context: str = '',
         sent_at: float | None = None,
         raw_text: str | None = None,
+        superseded: bool = False,
     ) -> None:
         recall_key = self._recall_key("group" if is_group else "private", group_id, user_id, str(message_id or ""))
         if message_id and recall_key in self._recalled:
@@ -6180,6 +6205,23 @@ class TaoYaoBot:
         stored = self._stored_text(role, is_group, text)
         if not pre_stored:
             await self.memory.add_message(session, "user", stored)
+        if superseded and is_group and not ambient:
+            log.info("群聊同一个人后面还有消息在排队：这条只记录、不单独生成回复，由最新一条一起回应：user=%s", user_id)
+            if profile and not pre_stored:
+                profile["relationship"] = self._relationship_from_profile(profile, role)
+                await self.profiles.add_message(
+                    user_id, scene, group_id, "user", stored, message_id=message_id,
+                    routing=self._group_routes.get((group_id, message_id)),
+                )
+                if (self.config.get("response_speed") or {}).get("defer_six_axis", False):
+                    self._six_axis.add(user_id, scene, group_id, {
+                        "text": text, "raw_text": raw_text, "message_id": message_id, "sent_at": sent_at,
+                        "analysis_context": reply_inputs.get("analysis_context"), "profile": profile})
+                else:
+                    await self._update_profile(
+                        profile, text, scene=scene, group_id=group_id, message_id=message_id,
+                        sent_at=sent_at, raw_text=raw_text, analysis_context=reply_inputs.get("analysis_context"))
+            return
         preparation_times = {}
         async def prepare_profile():
             started = time.monotonic()
@@ -6370,7 +6412,8 @@ class TaoYaoBot:
 
             messages, review_policy, departing, group_cfg = build_request(profile, search_context)
             # 所有人使用同一套分段上限，不再按角色区分。
-            max_segments = int(self.config["reply"]["max_segments"])
+            max_segments = int(self.config["reply"].get("group_max_segments", 5) if is_group
+                               else self.config["reply"]["max_segments"])
             max_chars = int(self.config["reply"]["max_chars"])
             if departing:
                 max_segments = min(max_segments, 2)

@@ -230,6 +230,7 @@ DEFAULTS: dict[str, Any] = {
         "segment": True,
         "max_chars": 70,
         "max_segments": 6,
+        "group_max_segments": 5,
         "segment_gap_min_seconds": 1.0,
         "segment_gap_max_seconds": 1.6,
         "context_messages": 16,
