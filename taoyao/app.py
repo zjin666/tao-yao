@@ -1680,6 +1680,27 @@ class TaoYaoBot:
         return ReplyIntent('','按当前对象的当地时间自然问候；不虚构对方今天的经历。',
             '到了早间问候时间。' if kind=='morning' else '到了晚间问候时间。',profile)
 
+    _USER_GREETING = (
+        ("morning", re.compile(r"^\W*(?:早安|早上好|早呀|早啊|早|good\s*morning)\W*$", re.I)),
+        ("night", re.compile(r"^\W*(?:晚安|夜安|good\s*night)\W*$", re.I)),
+    )
+
+    async def _note_user_greeting(self, user_id: int, text: str, profile: dict) -> None:
+        """用户自己先说了早安/晚安，当天就不再主动发同一种问候（只认整句就是问候的短消息）。"""
+        value = markers.cut_descriptions(str(text or "")).strip()
+        if not value or len(value) > 12:
+            return
+        for kind, pattern in self._USER_GREETING:
+            if not pattern.match(value):
+                continue
+            try:
+                tz_name = self._timezone_for(profile)
+                local_date = datetime.now(timezone.utc).astimezone(ZoneInfo(tz_name)).date().isoformat()
+                await self.profiles.mark_greeted(user_id, kind, local_date)
+            except Exception:
+                log.debug("记录用户问候失败", exc_info=True)
+            return
+
     async def _send_due_greetings(self) -> None:
         cfg = self.config.get("greetings") or {}
         if not cfg.get("enabled", True) or not self.profiles_enabled:
@@ -6115,6 +6136,7 @@ class TaoYaoBot:
                 log.info("跳过非好友/非群成员画像：%s", user_id)
         if profile is not None:
             profile["relationship"] = self._relationship_from_profile(profile, role)
+            await self._note_user_greeting(user_id, raw_text if raw_text is not None else text, profile)
 
         ok, reason, text = self.guard.check(text, role, user_id, rate_limit=not from_batch)
         if not ok:

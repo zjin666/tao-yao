@@ -129,7 +129,10 @@ def speaker_prefix(role: str, is_group: bool) -> str:
 # 所有程序拼进输入的标注（含占位），输出检查要拦：媒体和卡片类在任何位置都不行，其余只在行首查
 ANYWHERE_LABELS = DESCRIPTION_LABELS + (SHARE, CARD_LINK, CARD, FORWARD)
 LINE_START_LABELS = (VOICE, IMAGE_UNKNOWN, VIDEO_UNKNOWN, STICKER_UNKNOWN, FILE_UNKNOWN, QUOTED_IMAGE_UNKNOWN) + SPEAKER_LABELS
-SPEAKER_PREFIX_RE = re.compile(r"^(?:" + "|".join(re.escape(label) for label in (SPEAKER_GROUP_MEMBER, SPEAKER_OWNER)) + r")\s*")
+# QQ 客户端/日志里引用消息显示成“[回复]”或“[回复 某人]: ...”。这是平台的显示样式，不是桃夭的话；
+# 引用要用 [[quote]]，模型自己写出这个样子就是照抄，行首出现一律拦下。
+QUOTE_DISPLAY_PATTERN = r"\[回复(?:[\s\]:：]|$)"
+SPEAKER_PREFIX_RE =re.compile(r"^(?:" + "|".join(re.escape(label) for label in (SPEAKER_GROUP_MEMBER, SPEAKER_OWNER)) + r")\s*")
 
 
 def strip_speaker_prefix(text: str) -> str:
@@ -140,5 +143,5 @@ def strip_speaker_prefix(text: str) -> str:
 def label_leak_pattern() -> str:
     """输出检查用：回复里不该出现的输入标注。"""
     anywhere = "|".join(re.escape(label) for label in ANYWHERE_LABELS)
-    line_start = "|".join(re.escape(label) for label in LINE_START_LABELS)
+    line_start = "|".join(re.escape(label) for label in LINE_START_LABELS) + "|" + QUOTE_DISPLAY_PATTERN
     return rf"(?:{anywhere})|(?:^|\n)\s*(?:{line_start})"

@@ -2,7 +2,7 @@
 import re
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from taoyao.app import TaoYaoBot
 from taoyao.config import load_config
@@ -72,7 +72,8 @@ class OutgoingPokeTests(unittest.IsolatedAsyncioTestCase):
             return True
         bot._send_segments = fake_send
         bot._emotion_poke_worthy = AsyncMock(return_value=False)
-        await bot._maybe_send_reply_poke("group", 100, 5, "我提醒你，记得交作业。", "在吗", True, 100, False)
+        with patch("taoyao.app.random.random", return_value=0.99):      # 不抽中戳一戳，走 @
+            await bot._maybe_send_reply_poke("group", 100, 5, "我提醒你，记得交作业。", "在吗", True, 100, False)
         self.assertEqual(len(sent), 1)
         self.assertEqual((sent[0][0], sent[0][1], sent[0][3]["at_user_id"]), ("group", 100, 5))
         self.assertNotIn(markers.QUOTE, sent[0][2])
