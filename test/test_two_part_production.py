@@ -67,54 +67,39 @@ class TwoPartProductionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.utility_llm.chat.await_count,2)
         self.assertIn('慢慢说',result[0])
 
-    async def test_malformed_at_prefix_becomes_native_current_user_mention(self):
-        for prefix in ('at:0715 ', 'at：0715 ', '[[at:0715]] ', '[at:0715] '):
-            async def stream(messages):yield prefix+'你先听我说完。'
-            bot=self.bot(stream)
-            result=await bot._stream_reply([{'role':'user','content':'继续说'}],'group',100,2,70,
-                role='user',at_user_id=9000715,viewer_id=9000715,review_policy={'identity':'user'})
-            self.assertEqual(result[0],'你先听我说完')
-            self.assertEqual(bot.server.send_text.await_args.kwargs['at_user_id'],9000715)
-            self.assertNotIn('at:',str(bot.server.send_text.await_args))
-
-    async def test_at_suffix_never_mentions_a_different_user(self):
-        async def stream(messages):yield 'at:0715 你先听我说完。'
-        bot=self.bot(stream)
-        await bot._stream_reply([{'role':'user','content':'继续说'}],'group',100,2,70,
-            role='user',at_user_id=9000123,viewer_id=9000123,review_policy={'identity':'user'})
-        self.assertIsNone(bot.server.send_text.await_args.kwargs['at_user_id'])
-        self.assertNotIn('0715',bot.server.send_text.await_args.args[2])
-
-    async def test_named_at_is_converted_in_both_reply_paths(self):
-        for two_part in (True,False):
-            for prefix in ('at:测试昵称 ', 'at：测试昵称 ', '[[at:测试昵称]] ', '[at:测试昵称] ', 'at:测试昵称'):
-                with self.subTest(two_part=two_part,prefix=prefix):
-                    async def stream(messages):yield prefix+'这眼睛好圆。你再说说。'
+    async def test_old_at_spellings_are_not_converted_they_are_rejected_in_both_reply_paths(self):
+        """at:昵称、[at:0715]、【at】、[[ at ]]、[[AT]] 这些不是标记：不转换成 @（也不猜指的是谁），
+        当作违规拦下并只修正一次；修正后还是这种写法就什么都不发。"""
+        spellings = ('at:0715 ', 'at：0715 ', '[[at:0715]] ', '[at:0715] ', 'at:测试昵称 ', 'at：测试昵称 ',
+                     '[[at:测试昵称]] ', '[at:测试昵称] ', '【at】', '[[ at ]] ', '[[AT]] ', '[[At]] ')
+        for two_part in (True, False):
+            for prefix in spellings:
+                with self.subTest(two_part=two_part, prefix=prefix):
+                    async def stream(messages):yield prefix+'你先听我说完。'
                     bot=self.bot(stream)
                     bot.config['response_speed']['two_part_reply']=two_part
-                    bot.profiles=SimpleNamespace(get=AsyncMock(return_value={
-                        'user_id':'9000715','nickname':'测试昵称','basic_info':{}}))
                     result=await bot._stream_reply([{'role':'user','content':'继续说'}],'group',100,2,70,
                         role='user',at_user_id=9000715,viewer_id=9000715,review_policy={'identity':'user'})
-                    calls=bot.server.send_text.await_args_list
-                    self.assertTrue(calls)
-                    self.assertEqual(calls[0].kwargs['at_user_id'],9000715)
-                    self.assertTrue(all(c.kwargs['at_user_id'] is None for c in calls[1:]))
+                    bot.server.send_text.assert_not_awaited()
                     self.assertNotIn('at:',result[0])
-                    self.assertNotIn('测试昵称',result[0])
-                    self.assertIn('这眼睛好圆',result[0])
+                    self.assertNotIn('0715',result[0])
 
-    async def test_unknown_named_at_never_redirects_to_current_user(self):
-        async def stream(messages):yield 'at:另一个人 你先听我说完。'
-        bot=self.bot(stream)
-        bot.profiles=SimpleNamespace(get=AsyncMock(return_value={
-            'user_id':'9000715','nickname':'测试昵称','basic_info':{}}))
-        await bot._stream_reply([{'role':'user','content':'继续说'}],'group',100,2,70,
-            role='user',at_user_id=9000715,viewer_id=9000715,review_policy={'identity':'user'})
-        self.assertIsNone(bot.server.send_text.await_args.kwargs['at_user_id'])
-        self.assertNotIn('at:',bot.server.send_text.await_args.args[2])
+    async def test_the_exact_at_tag_mentions_the_current_user_on_the_first_bubble_only(self):
+        for two_part in (True, False):
+            with self.subTest(two_part=two_part):
+                async def stream(messages):yield '[[at]] 这眼睛好圆。你再说说。'
+                bot=self.bot(stream)
+                bot.config['response_speed']['two_part_reply']=two_part
+                result=await bot._stream_reply([{'role':'user','content':'继续说'}],'group',100,2,70,
+                    role='user',at_user_id=9000715,viewer_id=9000715,review_policy={'identity':'user'})
+                calls=bot.server.send_text.await_args_list
+                self.assertTrue(calls)
+                self.assertEqual(calls[0].kwargs['at_user_id'],9000715)
+                self.assertTrue(all(c.kwargs['at_user_id'] is None for c in calls[1:]))
+                self.assertNotIn('[[',result[0])
+                self.assertIn('这眼睛好圆',result[0])
 
-    async def test_legacy_at_becomes_real_onebot_segment_at_send_boundary(self):
+    async def test_send_boundary_strips_the_exact_tag_into_a_real_at_segment_and_blocks_old_spellings(self):
         from taoyao.onebot import OneBotServer
         async def stream(messages):yield '不用生成。'
         bot=self.bot(stream)
@@ -122,23 +107,26 @@ class TwoPartProductionTests(unittest.IsolatedAsyncioTestCase):
         server.send_group=AsyncMock(return_value={})
         bot.server=server
         profile={'user_id':'9000715','nickname':'测试昵称','basic_info':{}}
-        sent=await bot._send_segments('group',100,'at:测试昵称这眼睛好圆。',
+        sent=await bot._send_segments('group',100,'[[at]] 这眼睛好圆。',
             at_user_id=9000715,profile=profile,prepared=True,polish=False)
         self.assertTrue(sent)
         message=server.send_group.await_args.args[1]
         self.assertEqual(message[0],{'type':'at','data':{'qq':'9000715'}})
         self.assertIn('这眼睛好圆',str(message))
-        self.assertNotIn('at:',str(message))
+        self.assertNotIn('[[',str(message))
+        server.send_group.reset_mock()
+        for old in ('at:测试昵称这眼睛好圆。','[[at:测试昵称]] 这眼睛好圆。','【at】这眼睛好圆。'):
+            self.assertFalse(await bot._send_segments('group',100,old,at_user_id=9000715,profile=profile,
+                prepared=True,polish=False), old)
+        server.send_group.assert_not_awaited()                          # 写错的标记一个字都不会发出去
 
     async def test_no_at_target_does_not_create_mentions(self):
         async def stream(messages):yield '不用生成。'
         bot=self.bot(stream)
         bot.profiles=SimpleNamespace(get=AsyncMock())
         for target in ('private','group'):
-            await bot._send_segments(target,100,'at:测试昵称 你好。',
-                prepared=True,polish=False)
+            await bot._send_segments(target,100,'你好。',prepared=True,polish=False)
             self.assertIsNone(bot.server.send_text.await_args.kwargs['at_user_id'])
-            self.assertNotIn('at:',bot.server.send_text.await_args.args[2])
         bot.profiles.get.assert_not_awaited()
 
     async def test_approved_tail_splits_bubbles_without_extra_model_checks(self):

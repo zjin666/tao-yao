@@ -67,10 +67,10 @@ class ScopedReplyGuard:
                 return reason
             self.evidence=''
             cumulative=sent+'\n'+pending if sent else pending
-            reason=internal_notice_reason(cumulative) or reply_boundary_issue(cumulative,self.role)
-            if reason:return reason
             if is_internal_only(cumulative):
                 reason='internal_only';return reason
+            reason=internal_notice_reason(cumulative) or reply_boundary_issue(cumulative,self.role)
+            if reason:return reason
             key=self.key(sent,pending)
             if self.ticket==key:
                 reason='';return reason

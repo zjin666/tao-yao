@@ -57,6 +57,6 @@ def reply_boundary_issue(text: str, role: str) -> str:
     if role == 'owner':
         return ''
     # Remove allowed action tags without changing the text being reviewed.
-    visible = re.sub(r'\[\[(?:at|meme(?::[^\]]+)?)\]\]', '', text or '', flags=re.I)
+    visible = re.sub(r'\[\[(?:at|quote|meme(?::[^\]]+)?)\]\]', '', text or '', flags=re.I)
     vocative = re.compile(r'(?:^|[。！？!?\n])\s*[.…~～]*\s*(?:(?:嗯|好|哎|喂)[，,]\s*)?(?:哥哥们|哥哥|哥)(?=[，,。！？!?]|你|别|先|要|怎么|快)')
     return 'non_owner_vocative' if vocative.search(visible) else ''

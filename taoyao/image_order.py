@@ -36,7 +36,7 @@ def private_image_order(function):
             return await function(self,data)
         order=getattr(self,'_image_order',None)
         if order is None:order=self._image_order=ImageOrder()
-        images=any(isinstance(s,dict) and s.get('type') in ('image','mface','video','record')
+        images=any(isinstance(s,dict) and s.get('type') in ('image','mface','video','record','file')
                    for s in data.get('message') or [])
         if images:
             token=order.begin(data.get('user_id'))

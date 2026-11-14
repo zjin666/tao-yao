@@ -174,10 +174,14 @@ class OneBotServer:
         )
 
     async def send_text(
-        self, target: str, target_id: int, text: str, at_user_id: int | None = None
+        self, target: str, target_id: int, text: str, at_user_id: int | None = None,
+        quote_id: str | int | None = None,
     ) -> dict[str, Any]:
         message = []
-        if target == "group" and at_user_id:
+        if target == "group" and quote_id:
+            # QQ 的引用回复：点明回的是哪一条，对方也会收到提醒，所以不再另加 @。
+            message.append({"type": "reply", "data": {"id": str(quote_id)}})
+        elif target == "group" and at_user_id:
             message.append({"type": "at", "data": {"qq": str(int(at_user_id))}})
             message.append({"type": "text", "data": {"text": " "}})
         message.append({"type": "text", "data": {"text": text}})

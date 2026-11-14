@@ -181,6 +181,7 @@
     "max_chars": 70,
     "max_segments": 6,
     "group_max_segments": 5,
+    "quote_enabled": true,
     "context_messages": 16,
     "polish_fixed": true,
     "segment_gap_min_seconds": 1.0,
@@ -190,6 +191,33 @@
     "enabled": true,
     "dir": "memes",
     "probability": 0.35
+  },
+  "files": {
+    "enabled": true,
+    "max_mb": 10,
+    "max_chars": 4000,
+    "max_pages": 30
+  },
+  "requests": {
+    "enabled": true,
+    "friend": "ask",
+    "group_invite": "ask",
+    "group_add": "ask",
+    "owner_invite_auto": true,
+    "ttl_days": 7
+  },
+  "housekeeping": {
+    "enabled": true,
+    "dir": "backups/auto",
+    "hour": 4,
+    "keep": 7,
+    "backup_min_mb": 5,
+    "max_backup_mb": 300,
+    "include_annotation": true,
+    "media_compress_days": 7,
+    "media_max_side": 1280,
+    "max_data_mb": 400,
+    "check_seconds": 1800
   },
   "voice": {
     "enabled": true,

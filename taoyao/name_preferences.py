@@ -1,5 +1,6 @@
 """Exact user-name rejection requests; not requests to rename the bot."""
 import re
+from . import markers
 
 NAME_FIELDS = ('name', 'preferred_name', 'nicknames', 'aliases')
 
@@ -11,7 +12,7 @@ def name_key(value):
 def rejected_user_names(text, bot_names=('桃夭',)):
     # Only the current speaker's own request. Do not execute examples, quotes,
     # reported speech, actions, or another person's naming preferences.
-    text = str(text or '').split('\n[最近图片记忆]',1)[0]
+    text = markers.cut_descriptions(text)
     pattern = re.compile(r'(?:不要|别|不许|不准)(?:再)?(?:叫|喊|称呼)我\s*|'
                          r'(?:别|不要)(?:再)?管我叫\s*|我不喜欢你(?:叫|喊|称呼)我\s*')
     out=[]

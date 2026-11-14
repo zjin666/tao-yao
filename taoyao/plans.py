@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+from . import markers
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -26,7 +27,7 @@ def worth_extracting(text: str) -> bool:
     value = (text or "").strip()
     if not 4 <= len(value) <= 300 or value.startswith("/"):
         return False
-    value = re.split(r"\n\[(?:最近图片记忆|图片内容|视频内容|表情包内容)", value, maxsplit=1)[0]
+    value = markers.cut_descriptions(value)
     return bool(_HINT.search(value))
 
 

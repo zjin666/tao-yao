@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+from . import markers
 
 MAX_JUDGE_CHARS = 80
 JUDGE_PROMPT_HEAD = "判断用户这句话是不是明显还没说完"
@@ -14,14 +15,14 @@ JUDGE_PROMPT_HEAD = "判断用户这句话是不是明显还没说完"
 
 def worth_judging(text: str, max_chars: int = MAX_JUDGE_CHARS) -> bool:
     """命令、空消息、很长的消息和纯符号不用判断；长消息通常已经是完整的意思。"""
-    value = re.split(r"\n\[(?:最近图片记忆|图片内容|视频内容|表情包内容)", str(text or ""), maxsplit=1)[0].strip()
+    value = markers.cut_descriptions(text).strip()
     if not value or value.startswith("/") or len(value) > max_chars:
         return False
     return bool(re.search(r"[\w一-鿿]", value))
 
 
 def judge_messages(text: str) -> list[dict]:
-    value = re.split(r"\n\[(?:最近图片记忆|图片内容|视频内容|表情包内容)", str(text or ""), maxsplit=1)[0].strip()
+    value = markers.cut_descriptions(text).strip()
     return [
         {"role": "system", "content": (
             JUDGE_PROMPT_HEAD + "，下一条消息会接着补充。只输出JSON：{\"incomplete\":true} 或 {\"incomplete\":false}。\n"

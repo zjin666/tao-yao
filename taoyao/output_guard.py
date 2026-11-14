@@ -1,6 +1,7 @@
 """阻止机器人内部异常与提示块进入聊天；不屏蔽普通技术讨论。"""
 import json
 import re
+from . import markers
 
 NATURAL_RETRY = "……刚才没接上，你再发一次吧。"
 
@@ -38,6 +39,9 @@ def clean_reply_envelope(text: str) -> str:
     return '\n'.join(_clean_prefix(line) for line in text.split('\n'))
 
 
+# 发给模型的提示词分节标题：这些不会出现在给用户的回复里。新增分节时在这里加一个（测试会核对）。
+SECTION_TITLES = r'本轮群聊收束|称呼身份准则|当前对话对象|六维的具体表达方向|联网搜索结果|当前用户画像|系统提示|内部状态|回复执行流程|步骤[一二三四五]：[^】]+|当前时间|未发出的话|群回复指向|群聊隐私边界|图片/视频回复|聊天规则|日常接话|本条QQ引用|本轮答复意图|群聊自然插话|关系与称呼|关系参考|关于哥哥的事实|用户要求记住的事|群公共要求|长期记忆摘要|输出格式|桃夭已学知识参考|最近聊天[^】]*'
+
 def is_internal_only(text: str) -> bool:
     """Explicit self-directed material, not ordinary user-facing text with an envelope.
 
@@ -53,10 +57,17 @@ def is_internal_only(text: str) -> bool:
         return False
     return bool(re.match(
         r'(?:(?:system|developer|tool|analysis)\s*[:：]|'
-        r'【(?:本轮群聊收束|称呼身份准则|当前对话对象|六维的具体表达方向|联网搜索结果|当前用户画像|系统提示|内部状态|回复执行流程|步骤[一二三四五]：[^】]+)】|'
+        rf'【(?:{SECTION_TITLES})】|'
         r'(?:这是内部检索状态|此为内部状态)|'
         r'(?:给模型的指令|给助手的指令|仅供模型阅读|内部备注|思考过程)\s*[:：])',
         text, re.I))
+
+# 输入里的标注、识图和判断用的原始格式：模型有时会照抄进回复。和下面的内部通知分开，便于单独归类和修正。
+_MARKER_RE = re.compile(
+    markers.label_leak_pattern() + r"|"
+    r"形象[:：][^\n]{0,60}(?:神态|可能想表达)[:：]|"
+    r'\{\s*"(?:decision|category|allowed|reason|evidence|search|query|followup|guess|meaning|request_id|incomplete)"\s*:'
+)
 
 _INTERNAL_NOTICE = re.compile(
     r"Traceback\s*\(most recent call last\)|"
@@ -66,9 +77,8 @@ _INTERNAL_NOTICE = re.compile(
     r"Authorization\s*:\s*Bearer\s+\S+|\bsk-[A-Za-z0-9]{20,}\b|"
     r"(?:^|\n)\s*(?:ERROR|WARNING|INFO)\s+(?:taoyao|httpx|websockets)\b|"
     r"(?:^|\n)\s*\d{4}-\d\d-\d\d\s+\d\d:\d\d:\d\d[,\.]\d+\s+(?:ERROR|WARNING|INFO)\b|"
-    r"【(?:本轮群聊收束|称呼身份准则|当前对话对象|六维的具体表达方向|联网搜索结果|当前用户画像|系统提示|内部状态|回复执行流程|步骤[一二三四五]：[^】]+)】|"
+    rf"【(?:{SECTION_TITLES})】|"
     r"内部参考[，,]\s*不要向对方提起|这张表情已经认识|发送者(?:之前)?说明过(?:的表情含义|它的意思)|"
-    r"形象[:：][^；\n]{0,24}[；;]\s*可能想表达[:：]|"
     r"\[消息对象\s*\{|这是内部检索状态|此为内部状态|搜索暂时失败，尚未核实|没有查到可用搜索结果，未确认|"
     r"(?:^|\n)\s*(?:system|developer|assistant|tool|analysis)\s*[:：]\s*|"
     r"(?:^|\n)\s*(?:给模型的指令|给助手的指令|仅供模型阅读|内部备注|思考过程)\s*[:：]",
@@ -77,7 +87,9 @@ _INTERNAL_NOTICE = re.compile(
 
 
 def contains_internal_notice(text: str) -> bool:
-    return bool(_INTERNAL_NOTICE.search(text or ""))
+    text = text or ""
+    # 写错的标记（全角、大小写、多余空格或参数、at:昵称 等）和输入标注、原始格式一样算违规；合法标签不算。
+    return bool(_INTERNAL_NOTICE.search(text) or _MARKER_RE.search(text) or markers.malformed_tags(text))
 
 
 def internal_notice_reason(text: str) -> str:
@@ -91,6 +103,8 @@ def internal_notice_reason(text: str) -> str:
         return 'internal_prompt_or_routing'
     if re.search(r'^\s*(system|developer|assistant|tool)\s*:', text, re.I|re.M):
         return 'role_prefix'
+    if _MARKER_RE.search(text) or markers.malformed_tags(text):
+        return 'internal_marker'
     return 'exception_or_log'
 
 

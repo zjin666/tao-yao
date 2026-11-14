@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from .decision_semantics import DIRECTIONS, NEUTRAL_SIGNALS, SIGNALS
+from . import markers
 
 # ==========================================
 # 1. 核心配置：语义桶与增量映射表
@@ -387,7 +388,7 @@ def _valid_timezone(value: str) -> str:
 def explicit_user_timezone(text: str) -> str:
     """Current self-location/zone assertions only, not cities in clock questions."""
     # Generated media memories and quoted location examples are not declarations.
-    text = re.split(r'\n\[(?:最近图片记忆|图片内容|视频内容|表情包内容)\]', str(text or ''), maxsplit=1)[0]
+    text = markers.cut_descriptions(text)
     aliases = '|'.join(re.escape(k) for k in sorted(_TIMEZONE_HINTS, key=len, reverse=True))
     zone_value = rf'(?:[A-Za-z_]+/[A-Za-z_]+(?:/[A-Za-z_]+)?|{aliases})'
     declaration = re.compile(

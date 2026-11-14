@@ -1,6 +1,7 @@
 """Read only visible quoted content, and verify the OneBot conversation scope."""
 import html
 import re
+from . import markers
 import urllib.parse
 
 
@@ -31,10 +32,10 @@ def quote_text(message,image_texts=None):
             if label:parts.append(label)
             elif pending:
                 text=str(pending.pop(0) or '').strip()
-                parts.append(f'[图片内容] {text}' if text else '[图片或表情包]')
-            else:parts.append('[图片或表情包]')
-        elif kind=='face':parts.append('[表情]')
-        elif kind=='video':parts.append('[视频]')
+                parts.append(f'{markers.IMAGE} {text}' if text else markers.QUOTED_IMAGE_UNKNOWN)
+            else:parts.append(markers.QUOTED_IMAGE_UNKNOWN)
+        elif kind=='face':parts.append(markers.FACE)
+        elif kind=='video':parts.append(markers.VIDEO_UNKNOWN)
         elif kind=='at':parts.append('@'+str(data.get('name') or '被提及的人')+' ')
     return ''.join(parts).strip()[:2000]
 

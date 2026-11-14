@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from taoyao.app import TaoYaoBot
@@ -22,7 +23,8 @@ def setup_logging(level: str = "INFO") -> None:
         format=fmt,
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler(ROOT / "logs" / "bot.log", encoding="utf-8"),
+            # 日志按大小轮转：bot.log 超过 10 MB 就换一个新的，最多留 5 份旧的（旧的会被每日整理压成 .gz）。
+            RotatingFileHandler(ROOT / "logs" / "bot.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"),
         ],
     )
 
