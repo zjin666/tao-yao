@@ -498,6 +498,7 @@ class TaoYaoBot:
         self._relationship_cache: dict[int, tuple[dict, float]] = {}
         self._group_last_addressed: dict[int, tuple[float, int]] = {}
         self._group_last_bot_reply: dict[int, tuple[float, int, str, str]] = {}
+        self._group_open_topic: dict[int, tuple[float, str]] = {}   # 桃夭自己开的、还在等群友回答的话题
         self._group_reply_budget = GroupReplyBudget()
         self._group_routes: dict[tuple[int, str], dict] = {}
         self._group_topic_state: dict[int, dict] = {}
@@ -1680,26 +1681,73 @@ class TaoYaoBot:
         return ReplyIntent('','按当前对象的当地时间自然问候；不虚构对方今天的经历。',
             '到了早间问候时间。' if kind=='morning' else '到了晚间问候时间。',profile)
 
-    _USER_GREETING = (
-        ("morning", re.compile(r"^\W*(?:早安|早上好|早呀|早啊|早|good\s*morning)\W*$", re.I)),
-        ("night", re.compile(r"^\W*(?:晚安|夜安|good\s*night)\W*$", re.I)),
+    _NEG = r"(?<![没不别未忘])(?<!没有)(?<!还没)"
+    _GREETING_WORDS = (
+        ("morning", re.compile(_NEG + r"(?:早安|早上好|早呀|早啊|good\s*morning)", re.I)),
+        ("night", re.compile(_NEG + r"(?:晚安|夜安|good\s*night|(?:我|先|要|去)睡(?:了|啦|觉了|觉啦))", re.I)),
     )
 
-    async def _note_user_greeting(self, user_id: int, text: str, profile: dict) -> None:
-        """用户自己先说了早安/晚安，当天就不再主动发同一种问候（只认整句就是问候的短消息）。"""
+    _GREETING_HINT = re.compile(r"[早晚睡安醒]|起床|morning|night", re.I)
+
+    async def _judge_greeting(self, text: str, profile: dict) -> str:
+        """交给辅助模型判断：这条是不是用户在跟桃夭道早安/晚安（“早”“早啊”“我先睡了”都算）。
+        返回 morning / night / ""；模型不可用时退回关键词判断。"""
+        try:
+            tz_name = self._timezone_for(profile)
+            local = datetime.now(timezone.utc).astimezone(ZoneInfo(tz_name)).strftime("%H:%M")
+            raw = await self.utility_llm.chat([
+                {"role": "system", "content":
+                    '判断用户这条消息是不是在向对方道早安或晚安（含“早”“早啊”“早上好”“起床了”“我先睡了”“去睡了”“晚安”等口语）。'
+                    '只看这条消息本身和用户当地时间。询问对方睡没睡、说别人睡了、否定（没说晚安）、只是提到时间或熬夜不算。'
+                    '只输出 JSON：{"greeting":"morning"|"night"|"none"}。'},
+                {"role": "user", "content": json.dumps({"message": text, "user_local_time": local}, ensure_ascii=False)}])
+            match = re.search(r"\{.*\}", raw or "", re.S)
+            kind = str((json.loads(match[0]) if match else {}).get("greeting") or "").strip().lower()
+            return kind if kind in ("morning", "night") else ""
+        except Exception:
+            log.debug("模型判断问候失败，改用关键词", exc_info=True)
+        if re.search(r"[?？]|吗|没说|没跟|忘了", text):
+            return ""
+        for kind, pattern in self._GREETING_WORDS:
+            if pattern.search(text):
+                return kind
+        return ""
+
+    async def _record_greeting(self, user_id: int, kind: str, profile: dict | None) -> None:
+        try:
+            if profile is None:
+                profile = await self.profiles.get(user_id) or {}
+            tz_name = self._timezone_for(profile)
+            local_date = datetime.now(timezone.utc).astimezone(ZoneInfo(tz_name)).date().isoformat()
+            await self.profiles.mark_greeted(user_id, kind, local_date)
+        except Exception:
+            log.debug("记录问候失败", exc_info=True)
+
+    async def _note_greeting_said(self, user_id: int, text: str, profile: dict | None = None, *, by_bot: bool = False) -> None:
+        """用户或桃夭自己已经在聊天里说过早安/晚安，当天就不再主动发同一种问候。
+        用户的话先用关键字粗筛再交给模型判断；桃夭自己的话只认明确的早安/晚安字样。"""
         value = markers.cut_descriptions(str(text or "")).strip()
-        if not value or len(value) > 12:
+        if not value or len(value) > (80 if by_bot else 40):
             return
-        for kind, pattern in self._USER_GREETING:
-            if not pattern.match(value):
-                continue
-            try:
-                tz_name = self._timezone_for(profile)
-                local_date = datetime.now(timezone.utc).astimezone(ZoneInfo(tz_name)).date().isoformat()
-                await self.profiles.mark_greeted(user_id, kind, local_date)
-            except Exception:
-                log.debug("记录用户问候失败", exc_info=True)
-            return
+        if by_bot:
+            if re.search(r"[?？]|吗|没说", value) or not re.search(r"晚安|夜安|早安|早上好|good\s*(?:night|morning)", value, re.I):
+                return
+            kind = next((k for k, p in self._GREETING_WORDS if p.search(value)), "")
+        else:
+            if not self._GREETING_HINT.search(value):
+                return
+            kind = await self._judge_greeting(value, profile or {})
+        if kind:
+            await self._record_greeting(user_id, kind, profile)
+
+    def _spawn_greeting_note(self, user_id: int, text: str, profile: dict) -> None:
+        """后台判断，不让正常回复等它。"""
+        tasks = getattr(self, "_memory_tasks", None)
+        if tasks is None:
+            tasks = self._memory_tasks = set()
+        task = asyncio.create_task(self._note_greeting_said(user_id, text, profile))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
     async def _send_due_greetings(self) -> None:
         cfg = self.config.get("greetings") or {}
@@ -2927,7 +2975,12 @@ class TaoYaoBot:
         if not cfg.get("bot_words_enabled", True) or not text:
             return False
         last = self._group_last_bot_reply.get(group_id)
-        if not last or time.monotonic() - last[0] > float(cfg.get("bot_words_seconds", 180)):
+        opened = getattr(self, "_group_open_topic", {}).get(group_id)
+        topic_open = bool(opened) and time.monotonic() - opened[0] <= float(cfg.get("topic_answer_seconds", 1200))
+        if topic_open and (not last or last[0] < opened[0]):
+            last = (opened[0], 0, opened[1], '')
+        window = float(cfg.get("topic_answer_seconds", 1200)) if topic_open else float(cfg.get("bot_words_seconds", 180))
+        if not last or time.monotonic() - last[0] > window:
             return False
         if self._group_reply_budget.paused(group_id, time.monotonic(), user_id):
             return False
@@ -2954,6 +3007,11 @@ class TaoYaoBot:
                 "即使这句话是说给别人听的，也可以为 true。"
                 "只是话题相同、泛泛接话、闲聊、或与桃夭的话无明确关联，一律 false。"
             )
+            if topic_open and opened[1] == last[2]:
+                prompt += (
+                    "\n补充：上面这句是桃夭自己在群里主动发起的话题，还在等群友回应。"
+                    "新消息如果是在回答这个话题、表达看法或接着聊它（哪怕没有重提她的原词，也不要求是对她说），refers=true；"
+                    "和话题无关的闲聊才是 false。")
             reply = await getattr(self, "utility_llm", self.llm).chat([
                 {"role": "system", "content": "你是对话关系判断器，只输出合法 JSON。"},
                 {"role": "user", "content": prompt},
@@ -3196,7 +3254,8 @@ class TaoYaoBot:
                 requirements = ""
         prompt = (
             "群聊安静了一阵，主动起一个轻松话题。"
-            "1–2句，结合茶、书、花或日常。"
+            "1–2句，结合茶、书、花或日常。只围绕一件具体的事：写两句时，第二句必须直接承接第一句，"
+            "问的就是第一句提到的那件事或东西；不要第一句说花、第二句问杯子这样各写各的，两句连起来要是一个完整的意思。"
             "不@，不提内部信息；不接续、不评论群里之前聊过的内容，要像重新开场；以下旧话题不重复或改写。"
             f"\n旧话题：\n{history_text}"
             f"\n本群公共要求：\n{requirements or '（暂无）'}"
@@ -3223,6 +3282,10 @@ class TaoYaoBot:
             if delivered:
                 actual=text.delivered_text if isinstance(text,ReplyIntent) else text
                 await self.profiles.add_group_topic(group_id,actual)
+                # 话题是桃夭自己开的：群友之后的回答要能算“回应桃夭”，否则她开了话题却不接话。
+                now_mono=time.monotonic()
+                self._group_open_topic[group_id]=(now_mono,actual)
+                self._group_last_bot_reply[group_id]=(now_mono,0,actual,'')
                 log.info("群话题已发送：group=%s",group_id)
 
     async def _group_topic_loop(self) -> None:
@@ -6136,7 +6199,7 @@ class TaoYaoBot:
                 log.info("跳过非好友/非群成员画像：%s", user_id)
         if profile is not None:
             profile["relationship"] = self._relationship_from_profile(profile, role)
-            await self._note_user_greeting(user_id, raw_text if raw_text is not None else text, profile)
+            self._spawn_greeting_note(user_id, raw_text if raw_text is not None else text, profile)
 
         ok, reason, text = self.guard.check(text, role, user_id, rate_limit=not from_batch)
         if not ok:
@@ -7038,6 +7101,8 @@ class TaoYaoBot:
                 result.get('status') not in (None,'ok') or int(result.get('retcode') or 0)!=0):
                 log.warning('OneBot 未确认发送成功：target=%s',target)
                 return False
+            if target == 'private':
+                await self._note_greeting_said(target_id, text, by_bot=True)
             on_delivered = after_delivery.get()
             if on_delivered is not None:
                 on_delivered()

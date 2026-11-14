@@ -24,15 +24,16 @@ class UserGreetingTests(unittest.IsolatedAsyncioTestCase):
     async def test_short_greetings_are_recorded_for_the_users_local_day(self):
         today = datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
         for text, kind in (("早安", "morning"), ("早上好～", "morning"), ("Good morning", "morning"),
-                           ("晚安", "night"), ("晚安！", "night"), ("夜安", "night")):
+                           ("晚安", "night"), ("晚安！", "night"), ("夜安", "night"),
+                           ("那我先睡了，晚安哈", "night"), ("我去睡啦", "night"), ("早安，今天好冷", "morning")):
             bot, marks = greeting_bot()
-            await bot._note_user_greeting(5, text, {})
+            await bot._note_greeting_said(5, text, {})
             self.assertEqual(marks, [(5, kind, today)], text)
 
     async def test_longer_or_unrelated_messages_do_not_count(self):
-        for text in ("早安我的天今天好累", "我昨晚没说晚安就睡了", "你好", "", "晚安之后的配图怎么做"):
+        for text in ("我昨晚没说晚安就睡了", "你好", "", "你睡了吗", "怎么还不晚安？", "不晚安了", "还没睡呢"):
             bot, marks = greeting_bot()
-            await bot._note_user_greeting(5, text, {})
+            await bot._note_greeting_said(5, text, {})
             self.assertEqual(marks, [], text)
 
     async def test_a_greeted_day_is_skipped_by_the_scheduler(self):
@@ -58,6 +59,50 @@ class UserGreetingTests(unittest.IsolatedAsyncioTestCase):
         bot._send_segments = fake_send
         await bot._send_due_greetings()
         self.assertEqual(sent, [6])
+
+
+class ModelJudgedGreetingTests(unittest.IsolatedAsyncioTestCase):
+    def bot_with_model(self, answer):
+        bot, marks = greeting_bot()
+        bot.utility_llm = SimpleNamespace(chat=AsyncMock(return_value=answer))
+        bot._timezone_for = lambda profile: "Asia/Shanghai"
+        return bot, marks
+
+    async def test_a_bare_zao_is_a_morning_greeting_when_the_model_says_so(self):
+        bot, marks = self.bot_with_model('{"greeting":"morning"}')
+        await bot._note_greeting_said(5, "早啊", {})
+        self.assertEqual([m[1] for m in marks], ["morning"])
+        sent = bot.utility_llm.chat.await_args.args[0]
+        self.assertIn("早啊", sent[1]["content"])
+
+    async def test_model_none_records_nothing_even_if_keywords_match(self):
+        bot, marks = self.bot_with_model('{"greeting":"none"}')
+        await bot._note_greeting_said(5, "早点睡对身体好，别熬夜", {})
+        self.assertEqual(marks, [])
+
+    async def test_messages_without_any_hint_never_reach_the_model(self):
+        bot, marks = self.bot_with_model('{"greeting":"morning"}')
+        await bot._note_greeting_said(5, "帮我查一下天气", {})
+        bot.utility_llm.chat.assert_not_awaited()
+        self.assertEqual(marks, [])
+
+    async def test_model_failure_falls_back_to_keywords(self):
+        bot, marks = self.bot_with_model("")
+        bot.utility_llm.chat = AsyncMock(side_effect=RuntimeError("down"))
+        await bot._note_greeting_said(5, "晚安", {})
+        self.assertEqual([m[1] for m in marks], ["night"])
+
+
+class BotGreetingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_her_own_goodnight_in_a_reply_counts_but_her_sleep_talk_does_not(self):
+        bot, marks = greeting_bot()
+        bot.profiles.get = AsyncMock(return_value={})
+        await bot._note_greeting_said(5, "那哥哥晚安啦，明天记得给金鱼做个漂亮的脑袋哦", by_bot=True)
+        self.assertEqual([m[1] for m in marks], ["night"])
+        bot, marks = greeting_bot()
+        bot.profiles.get = AsyncMock(return_value={})
+        await bot._note_greeting_said(5, "我先去睡了，你也别熬", by_bot=True)
+        self.assertEqual(marks, [])
 
 
 class QuoteDisplayLabelTests(unittest.TestCase):
