@@ -55,7 +55,7 @@ from .impressions import ImpressionStore, impression_question
 from .knowledge import (KnowledgeStore, TEACH_RE, PUBLIC_RE, extract_lesson,
                         knowledge_inventory_question, temporary_learning_instruction)
 from .onebot import OneBotError, OneBotServer
-from .persona import build_system_prompt, load_persona
+from .persona import build_system_prompt, load_persona, recent_voice_note
 from .personality import (
     PROFILE_CUE_RE,
     PersonalityScoringModel,
@@ -6647,6 +6647,7 @@ class TaoYaoBot:
             system += knowledge_context
             system += held_note
             system += plans_block
+            system += recent_voice_note(history, is_group)
             system += self.HISTORY_TIME_NOTE
             messages = [{"role": "system", "content": system}]
             for item in history:

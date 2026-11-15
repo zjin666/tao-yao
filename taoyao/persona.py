@@ -1,6 +1,7 @@
 """桃夭正文提示：人设、关系、六维各写一次，数据按需注入。"""
 from __future__ import annotations
 from pathlib import Path
+import re
 from . import markers
 from .reply_flow import assemble_reply_flow, explicit_review_policy
 
@@ -40,6 +41,45 @@ def load_persona() -> str:
     if PERSONA_FILE.exists():
         return PERSONA_FILE.read_text(encoding='utf-8-sig').strip()
     return '你是桃夭，创造者的妹妹；想法奇特、想象丰富，自然接话并表达自己的想法。'
+
+
+_OPENER_RE = re.compile(r'^\s*((?:哼|诶|欸|嗯哼|嗯|哦|哎呀|哎|唉|啊|嘿|咦|哇|喔|噢|呀|呐|切|哈)+)\s*[，,！!…~。]')
+_SENTENCE_END_RE = re.compile(r'(?<=[。！？!?…~])')
+VARIED_PARTICLES = '呀、嘛、啦、诶、欸、咦、哎、嘿、呐、呢、噢、嗯哼、哇、喏、嘁'
+
+
+def recent_voice_note(history: list[dict], is_group: bool = False) -> str:
+    """看桃夭自己最近的几条回复：开头词扎堆、一直只回一句、原句重复，就提醒这次换一换。
+    只当口吻提示，不是内容；不够 3 条回复时不提示。"""
+    replies = []
+    for item in history or []:
+        if item.get('role') != 'assistant':
+            continue
+        text = markers.strip_speaker_prefix(str(item.get('content') or '')).strip()
+        if text and not text.startswith('['):
+            replies.append(text)
+    replies = replies[-8:]
+    if len(replies) < 3:
+        return ''
+    notes = []
+    openers = [m.group(1) for m in (_OPENER_RE.match(r) for r in replies[-6:]) if m]
+    crowded = sorted({o for o in openers if openers.count(o) >= 2})
+    if crowded:
+        notes.append('近期开头已多次用“' + '”“'.join(crowded) + '”，这次换个开头，或者干脆不加开头语气词；'
+                     '可换用的语气词：' + VARIED_PARTICLES + '，句中句尾都行，一条里不必处处都带。')
+    counts = [len([x for x in _SENTENCE_END_RE.split(r) if x.strip()]) for r in replies[-4:]]
+    if len(counts) >= 3 and max(counts) <= 1:
+        notes.append('近期每次都只回了一句，显得敷衍；这次先接住对方的话，再多补一两句自己的小想法、反应或追问'
+                     + ('（群里别超过3句）' if is_group else '') + '，对方只是随手戳一下也可以多说一点。')
+    said = []
+    for r in replies[-4:]:
+        said.extend(x.strip() for x in _SENTENCE_END_RE.split(r) if len(x.strip()) >= 6)
+    said = [x for x in dict.fromkeys(said) if said.count(x) >= 2][-6:]        # 只列真的重复了的
+    if said:
+        notes.append('这些话近期已重复说过，别原样或换个说法再说一遍：' + ' / '.join(x[:30] for x in said))
+    if not notes:
+        return ''
+    return '\n\n【近期口吻】\n' + '\n'.join(notes)
 
 
 def build_system_prompt(persona: str, category_descriptions: list[str], summary: str = '',
