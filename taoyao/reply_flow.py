@@ -2,14 +2,16 @@
 import json
 import re
 
+from .behavior_terms import behavior_note
+
 
 def explicit_review_policy(role: str, is_group: bool, tier: str) -> dict:
     """身份检查清单，不携带生成用的语言风格或关系策略。"""
     forbidden_intimacy = []
     if is_group or (role != 'owner' and tier != 'friend'):
-        forbidden_intimacy.append('明确向当前对象撒娇')
+        forbidden_intimacy.append('明确向当前对象' + behavior_note('撒娇'))
     if is_group or role != 'owner':
-        forbidden_intimacy.append('对当前对象明确暧昧、调情或建立恋爱关系')
+        forbidden_intimacy.append('对当前对象明确' + behavior_note('暧昧') + '、调情或建立恋爱关系')
     privacy = (
         '群里不得披露任何人的私聊内容、私密信息或私密长期记忆；本群公开信息不算泄露'
         if is_group else

@@ -1694,6 +1694,20 @@ class TaoYaoBot:
     )
 
     _GREETING_HINT = re.compile(r"[早晚睡安醒]|起床|morning|night", re.I)
+    _BARE_MORNING_RE = re.compile(r"^\s*(?:@\S+\s*)?(?:早|早啊|早呀|早哦|早噢)[\s!！~～。.]*$")
+
+    def _greeting_reply_intent(self, text: str, ambient: bool = False) -> str:
+        """对方在向桃夭道早安/晚安时，回复要先回一句问候（与定时问候是否跳过无关）。"""
+        value = str(text or "").strip()
+        if ambient or not value or len(value) > 40 or re.search(r"[?？]|吗|没说|没跟|忘了", value):
+            return ""
+        kind = "morning" if self._BARE_MORNING_RE.search(value) else next(
+            (k for k, p in self._GREETING_WORDS if p.search(value)), "")
+        if not kind:
+            return ""
+        word = "早安" if kind == "morning" else "晚安"
+        return (f"对方在向你道{word}。回复不必一定回{word}，但可以自然地带上一句（用自己的口吻，可带称呼，不必原样照搬），"
+                "是否带看当下语气；回应问候不算重复叮嘱。")
 
     async def _judge_greeting(self, text: str, profile: dict) -> str:
         """交给辅助模型判断：这条是不是用户在跟桃夭道早安/晚安（“早”“早啊”“我先睡了”都算）。
@@ -6352,6 +6366,8 @@ class TaoYaoBot:
                 raw_text if raw_text is not None else text, role, user_id, is_group, group_id,
                 message_id, ambient=ambient)
             requirement_asked = getattr(self, "_requirement_asked_id", {}).pop(str(user_id), None)
+        greeting_intent = "" if feature_intent or command.startswith("/") or reported_nickname else \
+            self._greeting_reply_intent(raw_text if raw_text is not None else text, ambient)
         memory_text = "" if feature_intent or command.startswith("/") or reported_nickname else self._memory_request_text(text)
         if memory_text and profile:
             self._schedule_memory_update(
@@ -6743,7 +6759,7 @@ class TaoYaoBot:
                 quote_context=quote_context,
                 message_routing=self._group_routes.get((group_id, message_id)) if is_group else None,
                 review_policy=review_policy,
-                reply_intent=feature_intent or ('这是别人想如何称呼桃夭，不是当前用户改昵称；不能由A替B登记或接受，需B本人亲自提出。自然请对方亲自来告诉你，不拿owner的旧昵称反复比较、拒绝或自称，不声称已联系对方。' if reported_nickname else ''),
+                reply_intent=feature_intent or greeting_intent or ('这是别人想如何称呼桃夭，不是当前用户改昵称；不能由A替B登记或接受，需B本人亲自提出。自然请对方亲自来告诉你，不拿owner的旧昵称反复比较、拒绝或自称，不声称已联系对方。' if reported_nickname else ''),
             )
             system += knowledge_context
             system += held_note
