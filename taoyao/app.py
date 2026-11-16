@@ -195,7 +195,12 @@ DELETE_CONFIRM_RE = re.compile(
     r"(确认|确定|是的|对|嗯|好|可以|同意|删吧|删掉|清空吧|忘吧|我确定|真的|确认删除)",
     re.IGNORECASE,
 )
-DELETE_CANCEL_RE = re.compile(r"(不要|别|不用|算了|取消|不删|不清空|还是不要)", re.IGNORECASE)
+# 粗筛：同时有“清空/删除/重置”一类动作和“画像/记录/记忆”一类对象，才交给模型判断是不是真要删
+DELETE_HINT_RE = re.compile(
+    r"(清空|清除|清掉|删除|删掉|删了|抹掉|重置|重来|忘掉|忘记|重新开始).{0,14}(画像|记录|记忆|六维|数据|印象|资料)|"
+    r"(画像|记录|记忆|六维|数据|印象|资料).{0,10}(清空|清除|清掉|删除|删掉|重置|抹掉)")
+DELETE_OTHER_CONFIRM_RE = re.compile(r"(确认|确定)(删除|清空|重置)|删吧|清空吧|重置吧")
+DELETE_CANCEL_RE =re.compile(r"(不要|别|不用|算了|取消|不删|不清空|还是不要)", re.IGNORECASE)
 REMEMBER_RE = re.compile(r"(?:帮我|给我|替我)?(?:记住|记一下|记下|记着|别忘了|不要忘记)")
 REMEMBER_QUESTION_RE = re.compile(
     r"(记得吗|还记得|记不记得|记住了吗|记住了没|记得住吗|(?:记住|记下|记牢)了(?:些|都)?(?:哪些|什么|啥|多少))")
@@ -486,6 +491,7 @@ class TaoYaoBot:
             ttl_days=float((config.get("requests") or {}).get("ttl_days", 7)))
         self._friend_cache: tuple[float, list[int]] | None = None
         self._pending_delete: dict[int, float] = {}
+        self._pending_delete_other: dict[int, tuple[float, int, str]] = {}   # owner 要删别人的画像，等确认
         self._known_groups: set[int] = set()
         self._group_last_activity: dict[int, float] = {}
         self._group_msg_counts: dict[int, int] = {}
@@ -5378,6 +5384,76 @@ class TaoYaoBot:
         await self._qzone_post(target, target_id, content, owner_text=raw, images=picked)
         return True
 
+    async def _erase_user(self, user_id: int) -> None:
+        await self.profiles.delete_user(user_id)
+        if getattr(self, "impressions", None) is not None:
+            await self.impressions.forget(user_id)
+        await self.memory.forget_session(f"user_private:{user_id}")
+        await self.memory.forget_session(f"owner_private:{user_id}")
+        if getattr(self, "privacy_index", None) is not None:
+            await self.privacy_index.forget_user(user_id)
+
+    async def _judge_delete_intent(self, text: str) -> tuple[str, str]:
+        """交给辅助模型判断这句话是不是要清空/重置画像记录：self=删自己的，other=删别人的（带对方称呼），none=不是。
+        称呼必须是原文里逐字出现的；模型不可用时只认原来的“删掉我的…”写法。"""
+        try:
+            raw = await self.utility_llm.chat([
+                {"role": "system", "content":
+                    '判断用户这句话是不是在要求清空、删除或重置某个人的画像/记忆/记录/六维/数据。'
+                    '输出 JSON：{"action":"self"|"other"|"none","target":""}。'
+                    'self=要清空说话人自己的；other=要清空另一个人的，target 填原文里逐字出现的那个人的称呼或QQ号；'
+                    'none=不是这类请求（只是聊天、问能不能、说别的东西被清空、清空对话上下文都算 none）。'
+                    '只看这一句本身；不因为句子里有“守夜”“某某”这类称呼就当成要删别人的，必须有明确的清空/删除/重置意图。'},
+                {"role": "user", "content": json.dumps({"message": text}, ensure_ascii=False)}])
+            match = re.search(r"\{.*\}", raw or "", re.S)
+            data = json.loads(match[0]) if match else {}
+            action = str(data.get("action") or "none").strip().lower()
+            who = str(data.get("target") or "").strip()
+            if action == "other" and (len(who) < 2 or who.casefold() not in text.casefold()):
+                return "none", ""
+            return (action, who) if action in ("self", "other") else ("none", "")
+        except Exception:
+            log.debug("模型判断删除意图失败", exc_info=True)
+            return "none", ""
+
+    async def _find_users_named(self, who: str) -> list[tuple[int, str]]:
+        digits = re.search(r"\d{5,12}", who)
+        owner = self._owner_qq()
+        found: dict[int, str] = {}
+        for item in await self.profiles.all_profiles():
+            uid = int(item.get("user_id") or 0)
+            name = str(item.get("nickname") or "")
+            if not uid or uid == owner:
+                continue
+            if (digits and str(uid) == digits.group()) or (name and who.casefold() in name.casefold()):
+                found[uid] = name or str(uid)
+        return list(found.items())
+
+    async def _request_delete_other(self, target: str, target_id: int, user_id: int, who: str,
+                                    is_group: bool, profile: dict | None) -> bool:
+        if is_group:
+            await self._send_segments(target, target_id, "删除记录请私聊我，不要在群里操作。", profile=profile)
+            return True
+        if user_id != self._owner_qq():
+            await self._send_segments(target, target_id, "别人的记录只有哥哥能处理，你只能清空关于你自己的。", profile=profile)
+            return True
+        matches = await self._find_users_named(who)
+        if not matches:
+            await self._send_segments(target, target_id,
+                f"我这儿没找到叫「{who}」的人。给我对方的 QQ 号，或者更完整的昵称吧。", profile=profile)
+            return True
+        if len(matches) > 1:
+            listed = "、".join(f"{name}（{uid}）" for uid, name in matches[:5])
+            await self._send_segments(target, target_id,
+                f"叫「{who}」的不止一个：{listed}。说清楚是哪一位，或者直接给 QQ 号。", profile=profile)
+            return True
+        victim, name = matches[0]
+        self.__dict__.setdefault("_pending_delete_other", {})[user_id] = (time.monotonic(), victim, name)
+        await self._send_segments(target, target_id,
+            f"要把{name}（QQ {victim}）的画像、摘要、私聊记录和六维都清空吗？这个不能撤回，群聊公共记录不受影响。"
+            "确定就再说一次「确认删除」。", profile=profile)
+        return True
+
     async def _handle_delete_request(
         self,
         target: str,
@@ -5388,6 +5464,26 @@ class TaoYaoBot:
         profile: dict | None = None,
     ) -> bool:
         raw = (text or "").strip()
+        other_pending = self.__dict__.setdefault("_pending_delete_other", {}).get(user_id)
+        if other_pending and time.monotonic() - other_pending[0] < 300 and not is_group:
+            if DELETE_CANCEL_RE.search(raw):
+                self.__dict__.setdefault("_pending_delete_other", {}).pop(user_id, None)
+                await self._send_segments(target, target_id, "好，不删了。", profile=profile)
+                return True
+            if DELETE_OTHER_CONFIRM_RE.search(raw):
+                self.__dict__.setdefault("_pending_delete_other", {}).pop(user_id, None)
+                _, victim, victim_name = other_pending
+                try:
+                    await self._erase_user(victim)
+                except Exception:
+                    log.exception("删除他人画像失败：%s", victim)
+                    await self._send_segments(target, target_id, "删除时出了点问题，先不要当它已经删掉了。", profile=profile)
+                    return True
+                await self._send_segments(
+                    target, target_id,
+                    f"已经删掉了。{victim_name}（QQ {victim}）的画像、摘要、私聊记录和六维都清空了，以后重新聊会从空白开始。",
+                    profile=profile)
+                return True
         request = bool(DELETE_REQUEST_RE.search(raw))
         pending_at = self._pending_delete.get(user_id)
         pending = bool(pending_at and time.monotonic() - pending_at < 300)
@@ -5395,6 +5491,11 @@ class TaoYaoBot:
             self._pending_delete.pop(user_id, None)
             await self._send_segments(target, target_id, "好，不删了。", profile=profile)
             return True
+        if not request and not pending and DELETE_HINT_RE.search(raw) and len(raw) <= 80:
+            action, who = await self._judge_delete_intent(raw)
+            if action == "other":
+                return await self._request_delete_other(target, target_id, user_id, who, is_group, profile)
+            request = action == "self"
         if not request and not pending:
             return False
         if is_group:
