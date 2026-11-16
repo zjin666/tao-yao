@@ -2230,7 +2230,7 @@ class TaoYaoBot:
             )[:2000]
             info = await extract_basic_info_llm(
                 text,
-                self.llm,
+                getattr(self, "utility_llm", None) or self.llm,      # 辅助判断用 DeepSeek，Qwen 只负责正文
                 bot_name=str(self.config.get("bot_name") or "桃夭"),
                 is_owner=is_owner,
                 recent_text=recent_text,

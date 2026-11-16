@@ -433,6 +433,22 @@ PROFILE_CUE_RE = re.compile(
 )
 
 
+_DISLIKE_CUE_RE = re.compile(r"讨厌|不喜欢|不太喜欢|不爱|不想吃|不吃|吃腻|腻了|受不了|反感|恶心|害怕|怕|厌烦|烦死|难吃|不好吃")
+
+
+def _dislike_is_evidenced(item: str, text: str, recent_text: str = "") -> bool:
+    """dislikes 只收用户亲口表达过反感的东西：词本身逐字出现，且同一句里有明确的反感用语。
+    报备吃了什么、日常习惯、被人追问后的回答都不算。"""
+    item = str(item or "").strip()
+    if not item:
+        return False
+    for line in [str(text or ""), *str(recent_text or "").split("\n")]:
+        if item in line and _DISLIKE_CUE_RE.search(line):
+            return True
+    return False
+
+
+
 async def extract_basic_info_llm(
     text: str,
     llm: Any,
@@ -520,6 +536,9 @@ async def extract_basic_info_llm(
     for key in ("hobbies", "dislikes"):
         if key in clean:
             clean[key] = [item for item in clean[key] if _looks_like_hobby(item)]
+            if key == "dislikes":
+                # 不喜欢必须有原话证据：该词逐字出现在用户某句话里，且同一句带明确的反感表达。
+                clean[key] = [item for item in clean[key] if _dislike_is_evidenced(item, text, recent_text)]
             if not clean[key]:
                 clean.pop(key, None)
     if "traits" in clean:
