@@ -1474,7 +1474,7 @@ class TaoYaoBot:
         if not POKE_EMOTION_CUE_RE.search(reply):
             return False
         try:
-            result = await self.llm.chat(
+            result = await getattr(self, "utility_llm", self.llm).chat(
                 [
                     {
                         "role": "system",
@@ -2279,7 +2279,7 @@ class TaoYaoBot:
         try:
             summary = await self.profiles.maybe_summarize(
                 user_id,
-                self.llm,
+                getattr(self, "utility_llm", self.llm),
                 after=int(cfg.get("summarize_after", 50)),
                 max_chars=int(cfg.get("summary_max_chars", 500)),
                 keep_raw=int(cfg.get("summary_keep_raw", 35)),
@@ -2302,7 +2302,7 @@ class TaoYaoBot:
         try:
             summary = await self.profiles.maybe_summarize_group(
                 group_id,
-                self.llm,
+                getattr(self, "utility_llm", self.llm),
                 after=int(cfg.get("summarize_after", 50)),
                 max_chars=int(cfg.get("summary_max_chars", 500)),
             )
@@ -2568,6 +2568,9 @@ class TaoYaoBot:
                 log.info("忽略未登记群：%s", group_id)
                 return
             self._known_groups.add(group_id)
+            # 前面有人发的图/表情包还在识别时，先等它入库，免得后面的评论“看不到那张图”。
+            media_gate, earlier_media = self._group_media_gate(data, group_id)
+            await self._wait_media_gate(group_id, earlier_media)
             cards=getattr(self,'_impression_cards',None)
             if cards is None:cards=self._impression_cards={}
             cards[(group_id,user_id)]=str((data.get('sender') or {}).get('card') or '')
@@ -2639,6 +2642,8 @@ class TaoYaoBot:
                             pre_stored = True
                     except Exception:
                         log.debug("预存群成员记录失败", exc_info=True)
+                if media_gate is not None:
+                    media_gate.set()
                 if routing["state"] in ("other", "unknown"):
                     log.debug("跳过指向其他人或引用未确认的群消息：group=%s", group_id)
                     return
@@ -2702,12 +2707,18 @@ class TaoYaoBot:
             if not text and mentioned:
                 text = "（叫了桃夭的名字）"
             if mentioned:
-                media_text = await self._media_text(data)
+                try:
+                    media_text = await self._media_text(data)
+                finally:
+                    if media_gate is not None:
+                        media_gate.set()
                 if media_text:
                     text = f"{text}\n{media_text}".strip()
                 forward_text = await self._forward_text(data)
                 if forward_text:
                     text = f"{text}\n{forward_text}".strip()
+            elif media_gate is not None:
+                media_gate.set()
             target, target_id, is_group = "group", group_id, True
             session = f"group:{group_id}"
         else:
@@ -3130,6 +3141,29 @@ class TaoYaoBot:
         route = await self._group_message_route(data, group_id, user_id)
         # 最近提过桃夭的名字，不足以证明后面的“你/她”指向桃夭。
         return route["state"] == "bot"
+
+    def _group_media_gate(self, data: dict[str, Any], group_id: int):
+        """登记本条群消息里的图片/表情包识别；返回（自己的信号, 前面还没识别完的信号列表）。"""
+        pending = self.__dict__.setdefault("_group_media_pending", {}).setdefault(group_id, [])
+        pending[:] = [event for event in pending if not event.is_set()]
+        earlier = list(pending)
+        own = None
+        if any(isinstance(seg, dict) and seg.get("type") in ("image", "video", "mface", "record")
+               for seg in (data.get("message") or [])):
+            own = asyncio.Event()
+            pending.append(own)
+            asyncio.get_running_loop().call_later(25, own.set)   # 兜底：异常或提前返回时不会一直挡住后面的消息
+        return own, earlier
+
+    async def _wait_media_gate(self, group_id: int, earlier: list) -> None:
+        earlier = [event for event in earlier if not event.is_set()]
+        if not earlier:
+            return
+        timeout = float(self._ambient_config().get("media_wait_seconds", 20))
+        try:
+            await asyncio.wait_for(asyncio.gather(*(event.wait() for event in earlier)), timeout)
+        except asyncio.TimeoutError:
+            log.info("等前面的图片识别超时，继续处理：group=%s", group_id)
 
     @staticmethod
     def _group_media_relevant(data: dict[str, Any], text: str) -> bool:
@@ -3688,7 +3722,7 @@ class TaoYaoBot:
                     "只输出 JSON：{\"accept\":true,\"summary\":\"...\"} 或 "
                     "{\"accept\":false,\"reason\":\"...\"}。"
                 )
-                reply = await self.llm.chat(
+                reply = await getattr(self, "utility_llm", self.llm).chat(
                     [
                         {"role": "system", "content": "你只输出合法 JSON，不要解释。"},
                         {"role": "user", "content": prompt},
@@ -7015,7 +7049,7 @@ class TaoYaoBot:
             started=time.monotonic()
             try:
                 if previous is not None:await asyncio.shield(previous)
-                if await self.memory.summarize_prepared(session,self.llm,prepared):
+                if await self.memory.summarize_prepared(session,getattr(self,'utility_llm',self.llm),prepared):
                     log.info('已更新长期记忆：%s',session)
             except asyncio.CancelledError:raise
             except Exception:log.exception('整理记忆失败')
@@ -7137,7 +7171,7 @@ class TaoYaoBot:
                 "不要改写句子，不要解释，只输出清理后的文本。\n\n"
                 f"{ruled}"
             )
-            cleaned = await self.llm.chat([
+            cleaned = await getattr(self, "utility_llm", self.llm).chat([
                 {"role": "system", "content": "你是正文符号清洗器，只输出清理后的文本，不改写内容。"},
                 {"role": "user", "content": prompt},
             ])

@@ -87,10 +87,12 @@ class ReplyPostworkTests(unittest.IsolatedAsyncioTestCase):
             bot._maybe_send_meme=AsyncMock();bot._maybe_send_reply_poke=AsyncMock()
             started=asyncio.Event();release=asyncio.Event();prompts=[]
             async def summarize(messages):
+                if '记忆整理器' not in str(messages[0]['content'])+str(messages[-1]['content']):
+                    return '{"allowed":true}'   # 发送前检查也走辅助模型，照常放行
                 prompts.append(messages[-1]['content'])
                 if len(prompts)==1:started.set();await release.wait();return '第一份摘要'
                 return '第二份摘要'
-            bot.llm.chat=AsyncMock(side_effect=summarize)
+            bot.utility_llm.chat=AsyncMock(side_effect=summarize)   # 整理记忆走辅助模型，Qwen 只负责正文
             try:
                 await asyncio.wait_for(self.turn(bot,1,'owner'),3)
                 await asyncio.wait_for(started.wait(),1)
