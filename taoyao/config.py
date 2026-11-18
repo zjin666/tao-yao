@@ -288,6 +288,7 @@ DEFAULTS: dict[str, Any] = {
         "db": "data/stickers.db",
         "max_per_scope": 200,
         "near_distance": 6,
+        "color_gap": 28,
         "pending_seconds": 600,
     },
     "user_memes": {

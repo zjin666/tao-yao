@@ -30,6 +30,7 @@ class StickerMemory:
         self.enabled = bool(cfg.get("enabled", True))
         self.max_per_scope = max(10, int(cfg.get("max_per_scope", 200)))
         self.near_distance = max(0, int(cfg.get("near_distance", 6)))
+        self.color_gap = float(cfg.get("color_gap", 28))
         self.pending_seconds = float(cfg.get("pending_seconds", 600))
         raw = Path(str(cfg.get("db") or "data/stickers.db"))
         self.path = raw if raw.is_absolute() else PROJECT_ROOT / raw
@@ -66,7 +67,9 @@ class StickerMemory:
                 img.seek(0)
                 small = img.convert("RGBA")
                 background = Image.new("RGBA", small.size, (255, 255, 255, 255))
-                gray = Image.alpha_composite(background, small).convert("L").resize((9, 8))
+                flat = Image.alpha_composite(background, small).convert("RGB")
+                gray = flat.convert("L").resize((9, 8))
+                colors = flat.resize((3, 3), Image.BOX).tobytes()     # 3×3 格的平均色，补上形状指纹看不到的色彩
             pixels = gray.tobytes()
         except Exception:
             return ""
@@ -74,14 +77,32 @@ class StickerMemory:
         for row in range(8):
             for col in range(8):
                 bits = (bits << 1) | (1 if pixels[row * 9 + col] > pixels[row * 9 + col + 1] else 0)
-        return f"{bits:016x}"
+        return f"{bits:016x}{colors.hex()}"          # 前 16 位是形状，后 54 位是 3×3 平均色
 
     @staticmethod
     def _distance(left: str, right: str) -> int:
         try:
-            return bin(int(left, 16) ^ int(right, 16)).count("1")
+            return bin(int(left[:16], 16) ^ int(right[:16], 16)).count("1")
         except ValueError:
             return 64
+
+    @staticmethod
+    def _color_gap(left: str, right: str) -> float:
+        """两张图 3×3 平均色的平均差（0–255）；旧记录没有色彩部分时不比较，返回 0。"""
+        if len(left) < 70 or len(right) < 70:
+            return 0.0
+        try:
+            a, b = bytes.fromhex(left[16:70]), bytes.fromhex(right[16:70])
+        except ValueError:
+            return 255.0
+        return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
+
+    def same_picture(self, left: str, right: str) -> int | None:
+        """形状相近且色彩也相近才算同一张；返回形状距离，不是同一张返回 None。"""
+        distance = self._distance(left, right)
+        if distance > self.near_distance or self._color_gap(left, right) > self.color_gap:
+            return None
+        return distance
 
     # ---- 查找与记录 ----
     @staticmethod
@@ -98,11 +119,13 @@ class StickerMemory:
             rows = self._conn.execute("SELECT * FROM stickers WHERE scope=?", (scope,)).fetchall()
             best, best_distance = None, self.near_distance + 1
             for row in rows:
-                distance = self._distance(fp, row[2])
-                if distance < best_distance:
+                distance = self.same_picture(fp, row[2])
+                if distance is not None and distance < best_distance:
                     best, best_distance = row, distance
             if best is None:
                 return None
+            if len(best[2]) < 70 <= len(fp):      # 旧记录只有形状，认出后补上色彩
+                self._conn.execute("UPDATE stickers SET fp=? WHERE id=?", (fp, best[0]))
             self._conn.execute(
                 "UPDATE stickers SET seen_count=seen_count+1, last_seen=? WHERE id=?",
                 (time.time(), best[0]))
@@ -110,6 +133,21 @@ class StickerMemory:
             entry = self._row(best)
             entry["seen_count"] += 1
             return entry
+
+    def borrowed_meaning(self, scope: str, fp: str, teachers: set[int]) -> dict | None:
+        """本范围还没有含义时，借用可信的人（owner）在别的范围里为同一张表情说明过的含义。
+        只借含义本身，不带原话和来源。"""
+        teachers = {int(item) for item in teachers if item}
+        if not self.enabled or not fp or not teachers or self._conn is None:
+            return None
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM stickers WHERE scope!=? AND meaning!='' ORDER BY last_seen DESC", (scope,)).fetchall()
+        for row in rows:
+            entry = self._row(row)
+            if entry["meaning_by"] in teachers and self.same_picture(fp, entry["fp"]) is not None:
+                return entry
+        return None
 
     def remember(self, scope: str, sender: int, fp: str, description: str) -> int:
         description = (description or "").strip()[:500]

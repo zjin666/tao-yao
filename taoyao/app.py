@@ -1100,6 +1100,18 @@ class TaoYaoBot:
                         self.sticker_memory.lookup, sticker_scope, sticker_fp)
             except Exception:
                 log.debug("查找表情包记忆失败", exc_info=True)
+        borrowed = None
+        if sticker_fp and not (sticker_entry and sticker_entry.get("meaning")):
+            try:   # 别的范围里 owner 说明过的同一张表情，这里直接沿用含义
+                borrowed = await asyncio.to_thread(
+                    self.sticker_memory.borrowed_meaning, sticker_scope, sticker_fp, {self._owner_qq()})
+                if borrowed and sticker_entry:
+                    await asyncio.to_thread(self.sticker_memory.set_meaning, int(sticker_entry["id"]),
+                                            borrowed["meaning_by"], borrowed["meaning"], "")
+                    sticker_entry = {**sticker_entry, "meaning": borrowed["meaning"],
+                                     "meaning_by": borrowed["meaning_by"]}
+            except Exception:
+                log.debug("借用表情含义失败", exc_info=True)
         try:
             if sticker_entry and sticker_entry.get("description"):
                 text = str(sticker_entry["description"])   # 见过的表情不再重新识图
@@ -1122,6 +1134,8 @@ class TaoYaoBot:
                         text = re.sub(r"^这是聊天里发的表情包[。，,：:\s]*", "", text)
                     else:
                         sticker_fp = ""            # 不是表情包：不建档，也不等说明
+                    if borrowed and sticker_fp:
+                        text = re.sub(r"[；;]?\s*可能想表达[：:][^；;\n]*", "", text).strip("；; ")
                 else:
                     text = await self.vision.describe(path, kind)
             self._describe_kept_image(kept, text)
@@ -1152,7 +1166,7 @@ class TaoYaoBot:
             try:
                 sticker_note = await asyncio.to_thread(
                     self._sticker_note, sticker_scope, sticker_sender, sticker_fp, text, sticker_entry,
-                    sticker_before)
+                    sticker_before, borrowed)
             except Exception:
                 log.debug("记录表情包失败", exc_info=True)
         return f"{label} {text}{sticker_note}" if text else f"{label}（未识别到文字）"
@@ -1172,11 +1186,15 @@ class TaoYaoBot:
         return "", 0
 
     def _sticker_note(self, scope: str, sender: int, fp: str, description: str, entry: dict | None,
-                      before: str = "") -> str:
+                      before: str = "", borrowed: dict | None = None) -> str:
         memory = self.sticker_memory
         sticker_id = int(entry["id"]) if entry else memory.remember(scope, sender, fp, description)
         if not sticker_id:
             return ""
+        if borrowed and not entry:   # 新建档的表情直接带上借来的含义，也就不再等下一句修正猜想
+            if memory.set_meaning(sticker_id, borrowed["meaning_by"], borrowed["meaning"], ""):
+                entry = {"id": sticker_id, "seen_count": 1, "meaning": borrowed["meaning"],
+                         "meaning_by": borrowed["meaning_by"]}
         if not entry:
             memory.await_next(scope, sticker_id, before)   # 等下一句话，后台用上下各一句修正猜想
         memory.mark_pending(scope, sender, sticker_id)
@@ -2592,6 +2610,7 @@ class TaoYaoBot:
             if role != "owner":
                 group_familiarity = await self._is_group_familiar(group_id, user_id)
             await self._save_group_images(data, group_id, user_id, message_id)
+            after_own_topic = self._take_fresh_topic(group_id, text)
             # 桃夭刚回过的同一用户，短时间内继续说话，视为续话，不强制 @。
             if mentioned:
                 self._group_last_addressed[group_id] = (time.monotonic(), user_id)
@@ -2599,6 +2618,13 @@ class TaoYaoBot:
                 mentioned = True
                 routing.update(state="bot", evidence="context_followup")
                 log.info("群聊续话命中：group=%s user=%s", group_id, user_id)
+            elif routing["state"] == "none" and after_own_topic and not await self._addressed_to_other(
+                    group_id, text):
+                # 桃夭刚在安静的群里开了话题，紧接着的第一句多半是冲着她来的（回答、追问或向她提要求）；
+                # 但称呼了别人、接别人的话的，不算。
+                mentioned = True
+                routing.update(state="bot", evidence="after_own_topic")
+                log.info("群话题后的第一句，按对桃夭说：group=%s user=%s", group_id, user_id)
             # 群聊规则对 owner 和普通群友一致，不再给 owner 免 @ 例外。
             require_at = bool(self.config.get("group_require_at", True))
             pre_stored = False
@@ -2655,6 +2681,11 @@ class TaoYaoBot:
                     if refers_bot:
                         same_topic = True
                         log.info("群聊消息引用桃夭原话：group=%s user=%s", group_id, user_id)
+                # 没点名的请求（“能不能来个冷笑话”“帮我看看”）：不能靠抽签，有人开口就该接。
+                open_request = routing["state"] == "none" and self._looks_like_open_request(text)
+                if open_request:
+                    same_topic = True
+                    log.info("群聊里有没点名的请求：group=%s user=%s", group_id, user_id)
                 self._remember_group_text(group_id, text)
                 if self._high_priority_text_eligible(text):
                     target_state = await self._group_target_state(
@@ -2669,7 +2700,7 @@ class TaoYaoBot:
                         high_probability = float(
                             self._ambient_config().get(probability_key, 0.4)
                         )
-                        if refers_bot or random.random() < high_probability:
+                        if refers_bot or open_request or random.random() < high_probability:
                             if await self._maybe_ambient(
                                 group_id,
                                 user_id,
@@ -2861,6 +2892,54 @@ class TaoYaoBot:
             r"知道了|没事|没事了|现在好了|好了|6+|草+|？+|\?+)[。！？!?…~\s]*",
             plain,
         ))
+
+    async def _addressed_to_other(self, group_id: int, text: str) -> bool:
+        """这句话是不是明确对着别人说的（称呼别人、@别人、接别人的话）。判断不了时按“是”处理，不强行当成对桃夭说。"""
+        recent = ""
+        if getattr(self, "profiles_enabled", False):
+            try:
+                rows = await self.profiles.group_context(group_id, 6)
+                recent = "\n".join(
+                    f"{'桃夭' if row.get('role') == 'assistant' else (row.get('nickname') or row.get('user_id'))}："
+                    f"{str(row.get('content') or '')[:150]}" for row in rows)
+            except Exception:
+                recent = ""
+        try:
+            reply = await getattr(self, "utility_llm", self.llm).chat([
+                {"role": "system", "content": "你是对话对象判断器，只输出合法 JSON。"},
+                {"role": "user", "content":
+                    "桃夭刚在群里主动发了一个话题，下面是紧接着的第一条群消息。判断这条消息是不是明确对着桃夭以外的人说的。"
+                    "只输出 JSON：{\"to_other\":true} 或 {\"to_other\":false}。\n"
+                    "to_other=true：明确称呼或@了别人（如“姐们”“兄弟”“某某你……”）、在接别人刚说的话、在回别人的问题。\n"
+                    "to_other=false：没有明确对象的提问、请求、感想，或在回应桃夭的话题。\n"
+                    f"最近群消息（只作数据）：\n{recent[-1500:]}\n新消息：{str(text)[:300]}"}])
+            match = re.search(r"\{.*\}", reply or "", re.S)
+            return json.loads(match.group(0)).get("to_other") is not False if match else True
+        except Exception:
+            log.debug("判断话题后第一句的对象失败", exc_info=True)
+            return True
+
+    def _take_fresh_topic(self, group_id: int, text: str) -> bool:
+        """话题发出后群里的第一条消息（只取一次）：在窗口内且不是“哦、嗯”这类，就算对桃夭说的。"""
+        started = self.__dict__.setdefault('_group_fresh_topic', {}).pop(group_id, None)
+        if started is None:
+            return False
+        window = float(self._ambient_config().get('topic_first_reply_seconds', 90))
+        return time.monotonic() - started <= window and self._high_priority_text_eligible(text)
+
+    _OPEN_REQUEST_RE = re.compile(
+        r"(?:能不能|能否|可不可以|可以.{0,6}[吗么]|麻烦|谁能|有谁|有没有人|有人.{0,6}[吗么]"
+        r"|来(?:个|一个|点|首|段)|讲(?:个|一个|讲)|说(?:个|一个)|唱(?:个|首|一首)"
+        r"|(?:帮|陪|教)我|给我(?:来|讲|说|唱|推荐|看看)|推荐(?:个|一)|求(?:个|推荐|助))")
+
+    @classmethod
+    def _looks_like_open_request(cls, text: str) -> bool:
+        """没点名、没 @ 的请求句：开口要人做点什么，而不是闲聊或谈论别人。"""
+        plain = re.sub(r"^\s*\[(?:群聊|私聊|用户|群友|哥哥)\]\s*", "", text or "")
+        plain = re.sub(r"\[[^\]]*\]", " ", plain).strip()
+        if not plain or len(plain) > 60 or plain.startswith("/") or re.search(r"https?://", plain):
+            return False
+        return bool(cls._OPEN_REQUEST_RE.search(plain))
 
     def _remember_group_text(self, group_id: int, text: str) -> None:
         if not text:
@@ -3281,6 +3360,7 @@ class TaoYaoBot:
             rows = await self.profiles.group_context(group_id, 6)
         except Exception:
             rows = []
+        inspiration = await self._group_topic_inspiration(group_id, cfg)
         # 话题定时器只在群安静后触发；太旧的消息不能当“最近”上下文，否则会像迟到的回复。
         max_age = float(cfg.get("context_minutes", 20)) * 60
         now_utc = datetime.now(timezone.utc)
@@ -3306,15 +3386,72 @@ class TaoYaoBot:
                 )
             except Exception:
                 requirements = ""
+        style_name, style_rule = self._pick_topic_style(group_id, bool(inspiration))
         prompt = (
-            "群聊安静了一阵，主动起一个轻松话题。"
-            "1–2句，结合茶、书、花或日常。只围绕一件具体的事：写两句时，第二句必须直接承接第一句，"
-            "问的就是第一句提到的那件事或东西；不要第一句说花、第二句问杯子这样各写各的，两句连起来要是一个完整的意思。"
-            "不@，不提内部信息；不接续、不评论群里之前聊过的内容，要像重新开场；以下旧话题不重复或改写。"
+            "群聊安静了一阵，主动起一个轻松话题。1–2句，只围绕一件具体的事：写两句时，第二句必须直接承接第一句，"
+            "两句连起来是一个完整的意思。\n"
+            f"这次的方式：{style_name}——{style_rule}\n"
+            "可以从下面“群里聊过的内容”里挑一件群友真的感兴趣的事来延伸，但要像重新开场："
+            "不评论、不回应某一句具体的话，不点名别人，不提任何人的私事；没有可参考的内容就自己想一个日常里的新话题。\n"
+            "问题要让群友能用自己的经历或选择来回答，不要给物件拟人的反问（如“你说它是不是……呀”），"
+            "也不要每次都写自己刚在泡茶、看书、浇花；旧话题的题材、句式和开头都不要重复或改写。"
+            "不@，不提内部信息。"
             f"\n旧话题：\n{history_text}"
             f"\n本群公共要求：\n{requirements or '（暂无）'}"
         )
-        return ReplyIntent('',prompt,'最近群里的消息：\n'+(context or '（近期没人说话，请另起新话题）'))
+        facts = '最近群里的消息：\n' + (context or '（近期没人说话）')
+        if inspiration:
+            facts += '\n\n群里聊过的内容（只作灵感）：\n' + inspiration
+        return ReplyIntent('', prompt, facts)
+
+    _TOPIC_STYLES = (
+        ('二选一', '抛一个轻松的二选一（两种吃法、两种做法、两种习惯），让人一句话就能选'),
+        ('小分享', '说一件自己此刻真实在做的小事或一个小发现，最后问群友有没有类似的'),
+        ('接群友话头', '挑群友聊过的一件具体事（作品、游戏、吃的、在做的东西），换个新角度追问，或说一个相关的小想法'),
+        ('小脑洞', '抛一个有趣的小假设或脑洞问题，可以略离谱，让大家接着编'),
+        ('今日小确幸', '问大家今天最小的一件好事，或最想做的一件小事'),
+        ('小知识', '说一个和群里聊过的东西有关的有趣小知识或联想，再问大家知不知道'),
+    )
+
+    def _pick_topic_style(self, group_id: int, has_inspiration: bool) -> tuple[str, str]:
+        """轮换话题方式：近 3 次用过的不再用；群里有可参考的内容时优先“接群友话头”。"""
+        recent = self.__dict__.setdefault('_group_topic_styles', {}).setdefault(group_id, [])
+        choices = [item for item in self._TOPIC_STYLES if item[0] not in recent[-3:]]
+        if not has_inspiration:
+            choices = [item for item in choices if item[0] not in ('接群友话头', '小知识')] or choices
+        pool = list(choices)
+        if has_inspiration:
+            pool += [item for item in choices if item[0] == '接群友话头']   # 有内容可接时加大这一种的机会
+        pick = random.choice(pool or list(self._TOPIC_STYLES))
+        recent.append(pick[0])
+        del recent[:-6]
+        return pick
+
+    async def _group_topic_inspiration(self, group_id: int, cfg: dict) -> str:
+        """最近一两天群友自己说过的话（只取本群的群友发言），给话题当灵感；没有就返回空。"""
+        if not self.profiles_enabled:
+            return ''
+        try:
+            hours = float(cfg.get('inspiration_hours', 36))
+            rows = await self.profiles.group_context(group_id, 40, int(hours * 3600))
+        except Exception:
+            return ''
+        lines: list[str] = []
+        for row in rows:
+            if row.get('role') != 'user':
+                continue
+            text = re.sub(r'^\s*\[(?:群友|哥哥|群聊|用户)\]\s*', '', str(row.get('content') or ''))
+            text = re.sub(r'\[(?:图片内容|表情包内容|视频内容|语音|文件内容)\][^\n]*', '', text).strip()
+            if len(text) < 6 or text.startswith('/'):
+                continue
+            lines.append(f"- {text[:70]}")
+        # 去重后取最近的 12 条
+        seen, unique = set(), []
+        for line in reversed(lines):
+            if line not in seen:
+                seen.add(line)
+                unique.append(line)
+        return '\n'.join(reversed(unique[:12]))
 
     def _topic_slots(self, now: datetime) -> list[float]:
         cfg = self.config.get("group_topics") or {}
@@ -3336,9 +3473,15 @@ class TaoYaoBot:
             if delivered:
                 actual=text.delivered_text if isinstance(text,ReplyIntent) else text
                 await self.profiles.add_group_topic(group_id,actual)
+                try:   # 话题也进群聊记录：群友回答时，生成回复要看得到她开的是什么话题
+                    await self.profiles.add_message(0, "group", group_id, "assistant", actual,
+                                                    message_id="", routing={"state": "none", "evidence": "group_topic"})
+                except Exception:
+                    log.debug("群话题写入群聊记录失败", exc_info=True)
                 # 话题是桃夭自己开的：群友之后的回答要能算“回应桃夭”，否则她开了话题却不接话。
                 now_mono=time.monotonic()
                 self._group_open_topic[group_id]=(now_mono,actual)
+                self.__dict__.setdefault('_group_fresh_topic', {})[group_id]=now_mono   # 还没人接话的新话题
                 self._group_last_bot_reply[group_id]=(now_mono,0,actual,'')
                 log.info("群话题已发送：group=%s",group_id)
 
@@ -3658,6 +3801,36 @@ class TaoYaoBot:
             return True
         return False
 
+    async def _recent_chat_text(self, user_id: int, is_group: bool, group_id: int, limit: int = 6) -> str:
+        """最近几句对话（只给判断模型理解“这个/上面那件事”用）。"""
+        if not getattr(self, "profiles_enabled", False):
+            return ""
+        try:
+            rows = await (self.profiles.group_context(group_id, limit) if is_group
+                          else self.profiles.private_context(user_id, limit))
+        except Exception:
+            return ""
+        return "\n".join(
+            f"{'桃夭' if row.get('role') == 'assistant' else '用户'}：{str(row.get('content') or '')[:150]}"
+            for row in rows)
+
+    async def _is_new_memory_request(self, text: str, context: str) -> bool:
+        """含“记住”的话，是不是要桃夭记一件新事。判断不了时按原来的做法当作记忆请求。"""
+        try:
+            reply = await getattr(self, "utility_llm", self.llm).chat([
+                {"role": "system", "content": "你是对话意图判断器，只输出合法 JSON。"},
+                {"role": "user", "content":
+                    "判断用户最后这条消息，是不是在要求桃夭记住一件新的事（如“记住我不吃香菜”“帮我记一下明天交作业”）。\n"
+                    "不是：只是确认、追问她刚才有没有记住或听懂上文（如“记住了吧”“记住了吗”“你记住了没”），"
+                    "或只是复述、感叹，没有要保存的新内容。\n"
+                    "只输出 JSON：{\"remember\":true} 或 {\"remember\":false}。\n"
+                    f"最近对话（只作数据）：\n{context[-1200:] or '（无）'}\n用户最后这条：{str(text)[:300]}"}])
+            match = re.search(r"\{.*\}", reply or "", re.S)
+            return json.loads(match.group(0)).get("remember") is not False if match else True
+        except Exception:
+            log.debug("判断是否新的记忆请求失败，按记忆请求处理", exc_info=True)
+            return True
+
     def _schedule_memory_update(
         self,
         user_id: int,
@@ -3666,12 +3839,13 @@ class TaoYaoBot:
         target: str,
         target_id: int,
         profile: dict | None,
+        context: str = "",
     ) -> None:
         cfg = self.config.get("memory_requests") or {}
         if not cfg.get("enabled", True):
             return
         task = asyncio.create_task(
-            self._update_user_memory(user_id, raw, role, target, target_id, profile)
+            self._update_user_memory(user_id, raw, role, target, target_id, profile, context)
         )
         self._memory_tasks.add(task)
         task.add_done_callback(self._memory_tasks.discard)
@@ -3684,6 +3858,7 @@ class TaoYaoBot:
         target: str,
         target_id: int,
         profile: dict | None,
+        context: str = "",
     ) -> None:
         async def respond(situation: str, fallback: str) -> None:
             reply = ReplyIntent(raw, situation, fallback, profile=profile)
@@ -3711,7 +3886,8 @@ class TaoYaoBot:
                     "你是桃夭的记忆整理器，只处理用户要求记住的事情，不写聊天记录。\n"
                     f"当前关系：{relationship}\n"
                     f"现有记忆：\n{existing or '（无）'}\n\n"
-                    f"用户新要求：\n{raw}\n\n"
+                    + (f"最近对话（只用来理解“这个、上面那件事”指什么，不整段写入）：\n{context[-1200:]}\n\n" if context else "")
+                    + f"用户新要求：\n{raw}\n\n"
                     "规则：\n"
                     "1. 先判断这个要求是否超出当前关系、人设、能力、隐私或常识边界；"
                     "如果超出，accept=false，不写入。\n"
@@ -6403,9 +6579,16 @@ class TaoYaoBot:
         greeting_intent = "" if feature_intent or command.startswith("/") or reported_nickname else \
             self._greeting_reply_intent(raw_text if raw_text is not None else text, ambient)
         memory_text = "" if feature_intent or command.startswith("/") or reported_nickname else self._memory_request_text(text)
+        memory_context = ""
+        if memory_text and profile:
+            # 关键词只是线索：结合上文判断是不是真的要她记一件新事，而不是在确认刚才聊的内容（“记住了吧”）。
+            memory_context = await self._recent_chat_text(user_id, is_group, group_id)
+            if not await self._is_new_memory_request(text, memory_context):
+                log.info("含“记住”但按上下文不是新的记忆请求，走普通回复：user=%s", user_id)
+                memory_text = ""
         if memory_text and profile:
             self._schedule_memory_update(
-                user_id, memory_text, role, target, target_id, profile
+                user_id, memory_text, role, target, target_id, profile, memory_context
             )
             return
         if not feature_intent and not ambient:
