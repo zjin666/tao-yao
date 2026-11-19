@@ -412,6 +412,14 @@ class TaoYaoBot:
                 "timeout": float(speed.get("utility_timeout", 12)),
             }}
             self.utility_llm = create_llm(utility_config, provider='deepseek')
+            # 整理摘要要写几百字，不能用只给 220 token 的判断型辅助模型，否则会被截断成“返回不完整”。
+            summary_config = {**config, "deepseek": {**(config.get("deepseek") or {}),
+                "model": speed.get("utility_model", "deepseek-flash"),
+                "max_tokens": int(speed.get("summary_max_tokens", 1500)),
+                "thinking": False, "temperature": 0.0,
+                "timeout": float(speed.get("summary_timeout", 30)),
+            }}
+            self.summary_llm = create_llm(summary_config, provider='deepseek')
         if (config.get('knowledge') or {}).get('enabled',True) and not (mock or config.get('mock_llm')):
             # Knowledge records may be longer than the 220-token yes/no helpers.
             knowledge_config={**config,'deepseek':{**(config.get('deepseek') or {}),
@@ -663,6 +671,8 @@ class TaoYaoBot:
         await self.llm.close()
         if self.utility_llm is not self.llm:
             await self.utility_llm.close()
+        if getattr(self,'summary_llm',None) not in (None,self.llm,self.utility_llm):
+            await self.summary_llm.close()
         if getattr(self,'knowledge_llm',None) is not None:
             await self.knowledge_llm.close()
         if self.impression_llm is not self.llm and self.impression_llm is not self.utility_llm and self.impression_llm is not getattr(self,'knowledge_llm',None):
@@ -2375,12 +2385,16 @@ class TaoYaoBot:
         self._summarizing.add(uid)
         asyncio.create_task(self._summarize_profile(uid))
 
+    def _summary_model(self):
+        """整理摘要用的模型：输出上限够写几百字；没有单独配置时退回辅助模型。"""
+        return getattr(self, "summary_llm", None) or getattr(self, "utility_llm", self.llm)
+
     async def _summarize_profile(self, user_id: int) -> None:
         cfg = self.config.get("profile") or {}
         try:
             summary = await self.profiles.maybe_summarize(
                 user_id,
-                getattr(self, "utility_llm", self.llm),
+                self._summary_model(),
                 after=int(cfg.get("summarize_after", 50)),
                 max_chars=int(cfg.get("summary_max_chars", 500)),
                 keep_raw=int(cfg.get("summary_keep_raw", 35)),
@@ -2403,7 +2417,7 @@ class TaoYaoBot:
         try:
             summary = await self.profiles.maybe_summarize_group(
                 group_id,
-                getattr(self, "utility_llm", self.llm),
+                self._summary_model(),
                 after=int(cfg.get("summarize_after", 50)),
                 max_chars=int(cfg.get("summary_max_chars", 500)),
             )
@@ -7360,7 +7374,7 @@ class TaoYaoBot:
             started=time.monotonic()
             try:
                 if previous is not None:await asyncio.shield(previous)
-                if await self.memory.summarize_prepared(session,getattr(self,'utility_llm',self.llm),prepared):
+                if await self.memory.summarize_prepared(session,self._summary_model(),prepared):
                     log.info('已更新长期记忆：%s',session)
             except asyncio.CancelledError:raise
             except Exception:log.exception('整理记忆失败')
