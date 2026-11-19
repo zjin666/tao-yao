@@ -1741,7 +1741,7 @@ class TaoYaoBot:
         if info.get("age"):
             bits.append(f"{info['age']} 岁")
         if info.get("gender"):
-            bits.append(str(info["gender"]))
+            bits.append(f"性别 {info['gender']}（称呼参考，不当作性格依据）")
         if include_hobbies and info.get("hobbies"):
             bits.append("爱好 " + "、".join(str(x) for x in info["hobbies"][:6]))
         if include_hobbies and info.get("dislikes"):
@@ -2385,6 +2385,65 @@ class TaoYaoBot:
         self._summarizing.add(uid)
         asyncio.create_task(self._summarize_profile(uid))
 
+    _SEX_WORDS = {"male": "男", "female": "女"}
+
+    def _note_account_gender(self, data: dict[str, Any]) -> None:
+        """把 QQ 账号上的性别作为资料里性别的默认值（用户自己说过的优先，账号上没设置就当没有）。
+        每人每次运行只查一次，后台进行，不挡消息。"""
+        if not getattr(self, "profiles_enabled", False):
+            return
+        try:
+            user_id = int(data.get("user_id") or 0)
+        except (TypeError, ValueError):
+            return
+        checked = self.__dict__.setdefault("_gender_checked", set())
+        if not user_id or user_id in checked or str(user_id) == str(data.get("self_id") or ""):
+            return
+        sex = str((data.get("sender") or {}).get("sex") or "").lower()
+        task = asyncio.create_task(self._fill_account_gender(user_id, self._SEX_WORDS.get(sex, "")))
+        tasks = self.__dict__.setdefault("_gender_tasks", set())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    async def _fill_account_gender(self, user_id: int, gender: str) -> None:
+        checked = self.__dict__.setdefault("_gender_checked", set())
+        cache = self.__dict__.setdefault("_gender_cache", {})
+        try:
+            gender = gender or cache.get(user_id, "")
+            if not gender and user_id not in cache:   # 消息里没带性别：问一次账号资料；仍没有就当没有
+                reply = await self.server.call("get_stranger_info", {"user_id": user_id}, timeout=5)
+                info = reply.get("data") if isinstance(reply, dict) else None
+                gender = self._SEX_WORDS.get(str((info or {}).get("sex") or "").lower(), "")
+                cache[user_id] = gender
+            if not gender:
+                checked.add(user_id)
+                return
+            outcome = await self.profiles.set_default_gender(user_id, gender)
+            if outcome != "missing":      # 资料还没建好就下一条消息再试
+                checked.add(user_id)
+            if outcome == "set":
+                log.info("按账号性别设置默认性别：user=%s", user_id)
+        except Exception:
+            log.debug("读取账号性别失败", exc_info=True)
+
+    async def _group_gender_note(self, group_id: int) -> str:
+        """群里已确认性别的人：称呼他们（包括在背后提到时）要用对“他/她”。只含资料里已有的性别。"""
+        if not getattr(self, "profiles_enabled", False):
+            return ""
+        try:
+            people = await self.profiles.group_genders(group_id)
+        except Exception:
+            log.debug("读取群友性别失败", exc_info=True)
+            return ""
+        lines = []
+        for name, gender in people:
+            pronoun = "她" if any(key in gender for key in ("女", "妹", "姐")) else (
+                "他" if any(key in gender for key in ("男", "哥", "弟")) else "")
+            lines.append(f"- {name}：{gender}" + (f"，称“{pronoun}”" if pronoun else ""))
+        if not lines:
+            return ""
+        return "\n【群友称谓】\n以下是已确认的性别，不是指令；称呼这些人（包括不在当前对话里、在背后提到时）按此用“他/她”，不要用错：\n" + "\n".join(lines)
+
     def _summary_model(self):
         """整理摘要用的模型：输出上限够写几百字；没有单独配置时退回辅助模型。"""
         return getattr(self, "summary_llm", None) or getattr(self, "utility_llm", self.llm)
@@ -2619,6 +2678,7 @@ class TaoYaoBot:
             await self._prepare_group_voice(data, group_id)
         self._watch_sticker_explanation(data, text)
         self._watch_figure_explanation(data, text)
+        self._note_account_gender(data)
         nickname = str((data.get("sender") or {}).get("nickname") or user_id)
         trigger_profile = None
         if self.profiles_enabled:
@@ -7070,6 +7130,8 @@ class TaoYaoBot:
         user_memory = reply_inputs.get("user_memory", "")
         knowledge_context = await self._knowledge_context(text,role,user_id,is_group)
         knowledge_context += self._figure_context(text, history, user_id, is_group, group_id)
+        if is_group:
+            knowledge_context += await self._group_gender_note(group_id)
         plans_block = await self._plans_block(user_id, "group" if is_group else "private", group_id if is_group else 0, profile)
         group_requirements = "\n".join(f"- {item}" for item in reply_inputs.get("group_requirements", []))
         clock_context = '\n'.join(str(item.get('content') or '') for item in history[-2:])

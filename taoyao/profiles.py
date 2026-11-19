@@ -513,6 +513,34 @@ class ProfileStore:
         if info:
             await self._run(self._update_basic_info, str(user_id), info, scene, int(group_id or 0))
 
+    def _set_default_gender(self, user_id: str, gender: str) -> str:
+        """账号性别作为默认：资料里（共用、各群、私聊）任何地方已有性别就不动，用户自己说的优先。
+        返回 "set"（已写入）、"kept"（已有性别）、"missing"（还没有这个人的资料）。"""
+        row = self._conn.execute(
+            "SELECT basic_info, basic_info_group, basic_info_private FROM profiles WHERE user_id = ?",
+            (user_id,)).fetchone()
+        if row is None:
+            return "missing"
+        def load(value):
+            try:
+                return json.loads(value or "{}")
+            except json.JSONDecodeError:
+                return {}
+        shared, groups, private = load(row["basic_info"]), load(row["basic_info_group"]), load(row["basic_info_private"])
+        if shared.get("gender") or private.get("gender") or groups.get("gender") or any(
+                isinstance(item, dict) and item.get("gender") for item in groups.values()):
+            return "kept"
+        shared["gender"] = gender
+        with self._conn:
+            self._conn.execute("UPDATE profiles SET basic_info = ? WHERE user_id = ?",
+                               (json.dumps(shared, ensure_ascii=False), user_id))
+        return "set"
+
+    async def set_default_gender(self, user_id: int | str, gender: str) -> str:
+        if gender not in ("男", "女"):
+            return "kept"
+        return await self._run(self._set_default_gender, str(user_id), gender)
+
     def _reject_user_names(self, user_id: str, names: list[str]) -> None:
         row=self._conn.execute('SELECT basic_info,basic_info_private,basic_info_group FROM profiles WHERE user_id=?',(user_id,)).fetchone()
         if row is None:return
@@ -839,6 +867,27 @@ class ProfileStore:
             "SELECT summary FROM group_summaries WHERE group_id = ?", (int(group_id),)
         ).fetchone()
         return str(row["summary"]) if row else ""
+
+    def _group_genders(self, group_id: int, limit: int) -> list[tuple[str, str]]:
+        rows = self._conn.execute(
+            "SELECT p.user_id, p.nickname, p.basic_info, p.basic_info_group FROM profiles p "
+            "WHERE p.user_id IN (SELECT DISTINCT user_id FROM user_messages "
+            "WHERE scene='group' AND group_id=? AND role='user')", (int(group_id),)).fetchall()
+        found: list[tuple[str, str]] = []
+        for row in rows:
+            try:
+                shared = json.loads(row["basic_info"] or "{}")
+                group_map = json.loads(row["basic_info_group"] or "{}")
+            except json.JSONDecodeError:
+                continue
+            gender = str(((group_map.get(str(int(group_id))) or {}).get("gender")) or shared.get("gender") or "").strip()
+            if gender:
+                found.append((str(row["nickname"] or row["user_id"]), gender))
+        return found[:limit]
+
+    async def group_genders(self, group_id: int, limit: int = 8) -> list[tuple[str, str]]:
+        """本群发过言、且资料里有性别的人：[(昵称, 性别)]。用来让桃夭称呼别人时不用错“他/她”。"""
+        return await self._run(self._group_genders, int(group_id or 0), int(limit))
 
     async def get_group_summary(self, group_id: int) -> str:
         return await self._run(self._get_group_summary, int(group_id or 0))
