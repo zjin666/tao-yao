@@ -291,6 +291,11 @@ DEFAULTS: dict[str, Any] = {
         "color_gap": 28,
         "pending_seconds": 600,
     },
+    "figure_memory": {
+        "enabled": True,
+        "db": "data/figures.db",
+        "max_per_speaker": 40,
+    },
     "user_memes": {
         "enabled": True,
         "dir": "user_memes",
