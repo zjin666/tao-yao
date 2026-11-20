@@ -168,7 +168,9 @@ class MemeLibrary:
     @staticmethod
     def _last_sentence(text: str) -> str:
         parts = [part.strip() for part in re.split(r"[。！？!?；;\n]+", text or "") if part.strip()]
-        return parts[-1] if parts else (text or "").strip()
+        # 只有 emoji/符号的行不算“最后一句”，否则表情包会拿一个 emoji 去匹配、丢了真正的话。
+        words = [part for part in parts if re.search(r"\w", part)]
+        return (words or parts or [(text or "").strip()])[-1]
 
     def _semantic_scores(self, text: str) -> dict[str, float]:
         if self._embedder is None:

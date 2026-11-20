@@ -2870,6 +2870,7 @@ class TaoYaoBot:
                                 same_topic=same_topic,
                                 group_familiarity=group_familiarity,
                                 message_id=message_id,
+                                direct_reference=refers_bot,
                             ):
                                 return
                 dice_hit = random.random() < float(
@@ -3428,6 +3429,7 @@ class TaoYaoBot:
         same_topic: bool = False,
         group_familiarity: str = "stranger",
         message_id: str = "",
+        direct_reference: bool = False,
     ) -> bool:
         cfg = self._ambient_config()
         if self._group_reply_budget.paused(group_id, time.monotonic(), user_id):
@@ -3442,15 +3444,21 @@ class TaoYaoBot:
         if not high_priority and not dice_roll and count < int(cfg.get("threshold", 8)):
             return False
         times = [t for t in self._group_ambient_times.get(group_id, []) if now - t < 3600]
+        chain = self._group_topic_chain.get(group_id, 0)
+        # 有人明确在回应桃夭刚说的话：不受“连续接话 3 次”和冷却限制（那是给没人叫她时的插话用的），
+        # 只保留最短间隔和一个较高的连续上限，免得和别的机器人互相接话停不下来。
+        direct = direct_reference and same_topic and chain < int(cfg.get("topic_direct_max_chain", 8))
         if same_topic:
-            if self._group_topic_chain.get(group_id, 0) >= int(cfg.get("topic_max_chain", 3)):
+            if not direct and chain >= int(cfg.get("topic_max_chain", 3)):
                 same_topic = False
             elif now - self._group_last_ambient.get(group_id, 0.0) < float(
                 cfg.get("topic_min_interval_seconds", 20)
             ):
                 return False
-        if not same_topic:
+        if not same_topic and not direct:
             if now - self._group_last_ambient.get(group_id, 0.0) < float(cfg.get("cooldown_seconds", 300)):
+                if direct_reference:
+                    log.info("群聊有人回应桃夭但被限制（冷却中）：group=%s user=%s", group_id, user_id)
                 return False
             if len(times) >= int(cfg.get("max_per_hour", 3)):
                 return False
@@ -5605,6 +5613,10 @@ class TaoYaoBot:
                     "如果有“等主人确认的评论回复”，主人说发/可以/就这样/行 表示确认，填 confirm_reply；"
                     "主人给出了改后的回复原话时 confirm_reply 且 content 填那句原话；主人说不发/算了/先别回，填 cancel_reply。"
                     "没有等确认的回复时不要返回 confirm_reply 或 cancel_reply。"
+                    "确认必须是主人用文字明确同意；表情包、图片、换了话题、反问、提问都不是确认，返回 none。"
+                    "主人说的是群聊里的事（如“群里在说你…”“群友…”“你在群里回一下”），或要桃夭在群里回应，不是说说评论，一律返回 none；"
+                    "回复说说评论只在主人明确提到说说、空间、评论区，或正在看评论列表并指向其中某条时才算，"
+                    "单独一句“你不去回复一下”“怎么不回”不算。"
                     "如果有“桃夭在等主人意见的好友说说”，主人当前这条是在回答它：主人给了怎么评论的想法或意见，填 comment_advice，"
                     "content 填主人的想法原话；主人的语气表示可以不评论（如不用评论、算了、没必要、随便、不用管、别评了、跳过），填 comment_skip。"
                     "没有这样的好友说说在等时，不要返回 comment_advice 或 comment_skip。"
@@ -5645,6 +5657,11 @@ class TaoYaoBot:
             log.debug("QQ 功能意图判断失败", exc_info=True)
             return None
 
+    @staticmethod
+    def _typed_part(text: str) -> str:
+        """消息里发送者自己打的字：去掉后面自动附上的图片、表情包、视频、语音、文件描述。"""
+        return re.split(r"\n?\[(?:图片内容|表情包内容|视频内容|语音|文件内容)\]", str(text or ""), maxsplit=1)[0].strip()
+
     async def _handle_owner_qq_intent(
         self, target: str, target_id: int, text: str
     ) -> bool:
@@ -5652,6 +5669,10 @@ class TaoYaoBot:
             return False
         raw = (text or "").strip()
         if not raw or raw.startswith("/"):
+            return False
+        # 只发了图片/表情包、没有文字：不构成发说说、回评论或确认回复（表情包的画面描述也不能当成“可以”）。
+        typed = self._typed_part(raw)
+        if not typed:
             return False
         try:
             history = await self.memory.recent(f"owner_private:{target_id}", 8)
@@ -5668,9 +5689,9 @@ class TaoYaoBot:
         proactive = self.__dict__.get("_qzone_pending_proactive")
         if proactive and time.monotonic() - proactive["at"] > 3 * 3600:
             self._qzone_pending_proactive = proactive = None
-        if not self._QQ_INTENT_HINT.search(raw) and not (
-                (talking or pending_reply or self._qzone_fresh_view()) and len(raw) <= 40) and not (
-                proactive and len(raw) <= 150):
+        if not self._QQ_INTENT_HINT.search(typed) and not (
+                (talking or pending_reply or self._qzone_fresh_view()) and len(typed) <= 40) and not (
+                proactive and len(typed) <= 150):
             return False
         images = self._recent_private_images(target_id)
         # 正在聊评论时，让模型看到带编号的评论列表和等确认的回复，才能把“回第二条”“发吧”对应上。
@@ -5681,7 +5702,7 @@ class TaoYaoBot:
         if pending_reply:
             pending_text = f"对 {pending_reply['item']['name']} 的评论“{pending_reply['item']['content']}”，拟回复“{pending_reply['content']}”"
         inferred = await self._infer_owner_qq_intent(
-            raw, history, images, qzone_comments.render(view["items"]) if view else "", pending_text,
+            typed, history, images, qzone_comments.render(view["items"]) if view else "", pending_text,
             f"{proactive['name']} 的说说：{proactive['post'][:150]}；配图：{proactive['image'][:100]}" if proactive else "")
         if not inferred:
             return False
