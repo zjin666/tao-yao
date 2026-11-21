@@ -2856,7 +2856,7 @@ class TaoYaoBot:
                     }.get(target_state)
                     if probability_key:
                         high_probability = float(
-                            self._ambient_config().get(probability_key, 0.4)
+                            self._ambient_config().get(probability_key, 0.5)
                         )
                         if refers_bot or open_request or random.random() < high_probability:
                             if await self._maybe_ambient(
@@ -2874,7 +2874,7 @@ class TaoYaoBot:
                             ):
                                 return
                 dice_hit = random.random() < float(
-                    self._ambient_config().get("dice_probability", 0.08)
+                    self._ambient_config().get("dice_probability", 0.12)
                 )
                 if await self._maybe_ambient(
                     group_id,
@@ -3441,7 +3441,7 @@ class TaoYaoBot:
         now = time.monotonic()
         count = self._group_msg_counts.get(group_id, 0) + 1
         self._group_msg_counts[group_id] = count
-        if not high_priority and not dice_roll and count < int(cfg.get("threshold", 8)):
+        if not high_priority and not dice_roll and count < int(cfg.get("threshold", 6)):
             return False
         times = [t for t in self._group_ambient_times.get(group_id, []) if now - t < 3600]
         chain = self._group_topic_chain.get(group_id, 0)
@@ -3456,11 +3456,11 @@ class TaoYaoBot:
             ):
                 return False
         if not same_topic and not direct:
-            if now - self._group_last_ambient.get(group_id, 0.0) < float(cfg.get("cooldown_seconds", 300)):
+            if now - self._group_last_ambient.get(group_id, 0.0) < float(cfg.get("cooldown_seconds", 120)):
                 if direct_reference:
                     log.info("群聊有人回应桃夭但被限制（冷却中）：group=%s user=%s", group_id, user_id)
                 return False
-            if len(times) >= int(cfg.get("max_per_hour", 3)):
+            if len(times) >= int(cfg.get("max_per_hour", 6)):
                 return False
         if not high_priority and not dice_roll and random.random() > float(cfg.get("probability", 0.35)):
             return False

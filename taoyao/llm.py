@@ -67,6 +67,8 @@ class DeepSeekLLM:
         self.max_tokens = int(config.get("max_tokens", 600))
         self.thinking = config.get("thinking")
         self.timeout = float(config.get("timeout", 60))
+        # 流式生成时，这么久一个字都没来（或中途断流这么久）就放弃，由调用方重试；比整体超时短得多。
+        self.first_token_timeout = max(1.0, min(self.timeout, float(config.get("first_token_timeout", 20))))
         key_file = Path(str(config.get("key_file") or ""))
         if not key_file.exists():
             raise LLMError(f"{self.provider_name} key 文件不存在：{key_file}")
@@ -94,6 +96,7 @@ class DeepSeekLLM:
                 f"{self.api_base}/chat/completions",
                 headers=headers,
                 json=payload,
+                timeout=httpx.Timeout(self.timeout, read=self.first_token_timeout),
             ) as response:
                 if response.status_code == 401:
                     raise LLMError(f"{self.provider_name} key 不对或过期了。")
@@ -120,6 +123,8 @@ class DeepSeekLLM:
                     content = delta.get("content")
                     if content:
                         yield str(content)
+        except httpx.TimeoutException as exc:
+            raise LLMError(f"{self.provider_name} 超过 {self.first_token_timeout:g} 秒没有返回内容，放弃本次生成") from exc
         except httpx.HTTPError as exc:
             raise LLMError(f"连不上 {self.provider_name}：{exc}") from exc
 
