@@ -293,6 +293,11 @@ DEFAULTS: dict[str, Any] = {
         "color_gap": 28,
         "pending_seconds": 600,
     },
+    "relook": {
+        "enabled": True,
+        "max_age_seconds": 1800,
+        "timeout_seconds": 45,
+    },
     "figure_memory": {
         "enabled": True,
         "db": "data/figures.db",

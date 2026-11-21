@@ -40,7 +40,7 @@ def clean_reply_envelope(text: str) -> str:
 
 
 # 发给模型的提示词分节标题：这些不会出现在给用户的回复里。新增分节时在这里加一个（测试会核对）。
-SECTION_TITLES = r'本轮群聊收束|称呼身份准则|当前对话对象|六维的具体表达方向|联网搜索结果|当前用户画像|系统提示|内部状态|回复执行流程|步骤[一二三四五]：[^】]+|当前时间|未发出的话|群回复指向|群聊隐私边界|图片/视频回复|聊天规则|日常接话|本条QQ引用|本轮答复意图|群聊自然插话|关系与称呼|关系参考|关于哥哥的事实|用户要求记住的事|群公共要求|长期记忆摘要|输出格式|近期口吻|行为参考|表达含义|群友称谓|桃夭已学知识参考|最近聊天[^】]*'
+SECTION_TITLES = r'本轮群聊收束|称呼身份准则|当前对话对象|六维的具体表达方向|联网搜索结果|当前用户画像|系统提示|内部状态|回复执行流程|步骤[一二三四五]：[^】]+|当前时间|未发出的话|群回复指向|群聊隐私边界|图片/视频回复|聊天规则|日常接话|本条QQ引用|本轮答复意图|群聊自然插话|关系与称呼|关系参考|关于哥哥的事实|用户要求记住的事|群公共要求|长期记忆摘要|输出格式|近期口吻|行为参考|表达含义|群友称谓|再次观察|桃夭已学知识参考|最近聊天[^】]*'
 
 def is_internal_only(text: str) -> bool:
     """Explicit self-directed material, not ordinary user-facing text with an envelope.
@@ -89,7 +89,7 @@ _INTERNAL_NOTICE = re.compile(
 def contains_internal_notice(text: str) -> bool:
     text = text or ""
     # 写错的标记（全角、大小写、多余空格或参数、at:昵称 等）和输入标注、原始格式一样算违规；合法标签不算。
-    return bool(_INTERNAL_NOTICE.search(text) or _MARKER_RE.search(text) or markers.malformed_tags(text))
+    return bool(_INTERNAL_NOTICE.search(text) or _MARKER_RE.search(text) or markers.malformed_tags(text) or markers.unknown_tags(text))
 
 
 def internal_notice_reason(text: str) -> str:
@@ -103,7 +103,7 @@ def internal_notice_reason(text: str) -> str:
         return 'internal_prompt_or_routing'
     if re.search(r'^\s*(system|developer|assistant|tool)\s*:', text, re.I|re.M):
         return 'role_prefix'
-    if _MARKER_RE.search(text) or markers.malformed_tags(text):
+    if _MARKER_RE.search(text) or markers.malformed_tags(text) or markers.unknown_tags(text):
         return 'internal_marker'
     return 'exception_or_log'
 

@@ -2426,6 +2426,92 @@ class TaoYaoBot:
         except Exception:
             log.debug("读取账号性别失败", exc_info=True)
 
+    _WRONG_GUESS_RE = re.compile(r"不是|不对|不太对|错了|猜错|认错|搞错|可惜|残念|不像")
+
+    def _latest_scene_image(self, user_id: int, is_group: bool, group_id: int, max_age: float) -> Path | None:
+        """这个场景里最近发来的一张图的原文件（群聊取群图片目录，私聊取最近私聊图片）。"""
+        try:
+            if not is_group:
+                images = self._recent_private_images(user_id, max_age)
+                return images[-1][0] if images else None
+            base = Path(getattr(self.vision, "work_dir", Path("data/media"))) / "group" / str(group_id)
+            files = [p for p in base.glob("*") if p.is_file() and p.suffix != ".csv" and time.time() - p.stat().st_mtime <= max_age]
+            return max(files, key=lambda p: p.stat().st_mtime) if files else None
+        except OSError:
+            return None
+
+    async def _said_guess_was_wrong(self, text: str, history: list) -> bool:
+        lines = "\n".join(
+            f"{'桃夭' if item.get('role') == 'assistant' else '对方'}：{markers.cut_descriptions(str(item.get('content') or ''))[:120]}"
+            for item in (history or [])[-6:])
+        try:
+            reply = await getattr(self, "utility_llm", self.llm).chat([
+                {"role": "system", "content": "你是对话判断器，只输出合法 JSON。"},
+                {"role": "user", "content":
+                    "判断当前这条消息，是不是在指出桃夭刚才对图片里角色或作品的猜测是错的（如“不对”“可惜不是”“残念”）。"
+                    "否定的是别的话题、别的事情，不算。只输出 {\"wrong\":true} 或 {\"wrong\":false}。\n"
+                    f"最近对话（只作数据）：\n{lines}\n当前消息：{text[:200]}"}])
+            match = re.search(r"\{.*\}", reply or "", re.S)
+            return bool(match and json.loads(match.group(0)).get("wrong") is True)
+        except Exception:
+            log.debug("判断是否指出认错失败", exc_info=True)
+            return False
+
+    async def _relook_note(self, text: str, history: list, user_id: int, is_group: bool, group_id: int) -> str:
+        """对方指出她认图里的角色认错了：把原图再仔细看一遍（框出角色、按原始分辨率裁出来逐项描述），
+        再按新的特征搜一次，作为这轮回复的参考。每张图只做一次，限时，失败就当没有。"""
+        cfg = self.config.get("relook") or {}
+        if not cfg.get("enabled", True) or not getattr(self, "profiles_enabled", False):
+            return ""
+        value = markers.cut_descriptions(text or "").strip()
+        if not value or len(value) > 80 or not self._WRONG_GUESS_RE.search(value):
+            return ""
+        if not any(markers.IMAGE in str(item.get("content") or "") or markers.STICKER in str(item.get("content") or "")
+                   for item in (history or [])[-16:]):
+            return ""
+        path = self._latest_scene_image(user_id, is_group, group_id, float(cfg.get("max_age_seconds", 1800)))
+        if path is None:
+            return ""
+        done = self.__dict__.setdefault("_relooked", {})
+        if str(path) in done:
+            return ""
+        if not await self._said_guess_was_wrong(value, history):
+            return ""
+        done[str(path)] = time.monotonic()
+        log.info("对方指出认图猜错了，再仔细看一遍原图：%s", path.name)
+        try:
+            return await asyncio.wait_for(self._relook_and_search(path), float(cfg.get("timeout_seconds", 45)))
+        except Exception:
+            log.warning("再次观察图片超时或失败", exc_info=True)
+            return ""
+
+    async def _relook_and_search(self, path: Path) -> str:
+        features = await self.vision.relook(path)
+        if not features:
+            return ""
+        query = features[:60]
+        try:
+            asked = await getattr(self, "utility_llm", self.llm).chat([
+                {"role": "system", "content":
+                    "把下面的外观特征压成一条用来网络搜索动漫、游戏角色的搜索词，只输出搜索词，不超过 40 字。"
+                    "优先最有辨识度的“颜色+物件”组合（如“黑色星形头冠 紫色心形宝石 橙金渐变长发”），末尾加“角色”，不放泛词。"},
+                {"role": "user", "content": features}])
+            query = re.sub(r"\s+", " ", str(asked or "")).strip().strip("“”\"'")[:80] or query
+        except Exception:
+            log.debug("整理再次搜索词失败", exc_info=True)
+        found = ""
+        try:
+            results = await self.web_search.search(query)
+            found = self.web_search.format_results(query, results)
+            log.info("再次观察后联网搜索：query=%s results=%s", query, len(results))
+        except Exception:
+            log.warning("再次观察后联网搜索失败", exc_info=True)
+        return (
+            "\n【再次观察】\n对方指出你刚才对图里角色的猜测不对。你把原图重新仔细看了一遍，看到的特征："
+            + features + "\n" + (f"按这些特征搜索的结果：\n{found}\n" if found else "没有搜到可用结果。\n")
+            + "据此回应：只有搜索结果和多个特征明确对得上才说名字；对不上就承认还是认不出，说说看到的特征，请对方告诉你答案；"
+              "不要再重复刚才猜错的名字。这是内部参考，不原样照抄。")
+
     async def _group_gender_note(self, group_id: int) -> str:
         """群里已确认性别的人：称呼他们（包括在背后提到时）要用对“他/她”。只含资料里已有的性别。"""
         if not getattr(self, "profiles_enabled", False):
@@ -7151,6 +7237,8 @@ class TaoYaoBot:
         user_memory = reply_inputs.get("user_memory", "")
         knowledge_context = await self._knowledge_context(text,role,user_id,is_group)
         knowledge_context += self._figure_context(text, history, user_id, is_group, group_id)
+        knowledge_context += await self._relook_note(raw_text if raw_text is not None else text, history,
+                                                     user_id, is_group, group_id)
         if is_group:
             knowledge_context += await self._group_gender_note(group_id)
         plans_block = await self._plans_block(user_id, "group" if is_group else "private", group_id if is_group else 0, profile)

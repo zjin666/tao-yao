@@ -23,7 +23,10 @@ IMAGE_PROMPT = (
     "用中文描述这张图片的内容，并提取图片里出现的文字。要求：先数清画面里一共有几个独立的角色或生物；"
     "角色身上长出来的耳朵、尾巴、鱼鳍、翅膀、角等属于角色本身，不要当成另一个生物或物品；"
     "如果某个物体既可能是单独的东西、也可能是角色自己的身体部分（比如从身后绕到身前或被抱着的尾巴），"
-    "两种可能都写出来，不要只选一种；写明角色的动作、表情和姿势；不确定的写“可能”，不要编造；"
+    "两种可能都写出来，不要只选一种；写明角色的动作、表情和姿势；"
+    "写清能用来认出角色的特征：发色（含渐变）和发型、头饰和配饰的真实形状、服装配色、指甲等细节，"
+    "形状看不清就写“某种”，不要套成熟悉的形状；如果是软件或网页截图，写出窗口标题栏或软件名，字太小看不清就写“看不清”，不要猜；"
+    "不确定的写“可能”，不要编造，不要猜具体的角色名或作品名；"
     "控制在 160 字以内，不要用列表和 Markdown 格式。"
 )
 
@@ -412,6 +415,96 @@ class MediaDescriber:
         return (base + f"紧挨着这张表情的上一句聊天是“{context}”，只在图本身有歧义时用来帮助判断；"
                 "以图片里的神态、动作和文字为准，两者冲突时相信图片；不要复述这句话，"
                 "也不要因此编造画面里没有的内容。")
+
+    BOX_PROMPT = (
+        "找出画面里最主要的角色（人物或生物）整体所在的区域。只输出一行 JSON：{\"box\":[x0,y0,x1,y1]}，"
+        "坐标是相对整张图的千分比（0 到 1000，左上角为原点）。没有角色就输出 {\"box\":null}。"
+    )
+    RELOOK_PROMPT = (
+        "仔细观察这张图里最主要的角色，逐项写出能用来认出她的特征：发色（含渐变）和发型、头饰（颜色和形状）、"
+        "眼睛颜色、服装各部分的颜色和款式、配饰、手持物、指甲，以及画面里能读清的文字（字太小看不清就写“看不清”）。"
+        "只写看到的，颜色和形状要和对应的部位对上，不确定的写“可能”，不要猜角色名或作品名。"
+        "不要用列表和 Markdown 格式，控制在 220 字以内。"
+    )
+
+    async def _character_box(self, path: Path) -> list[float] | None:
+        """让视觉模型在缩小的图上框出主要角色的位置（千分比）；框不出来或不可信返回 None。"""
+        try:
+            from PIL import Image
+            thumb = self.work_dir / f"{uuid.uuid4().hex}.jpg"
+            with Image.open(path) as image:
+                image.seek(0)
+                small = image.convert("RGB")
+                small.thumbnail((768, 768))
+                small.save(thumb, "JPEG", quality=80)
+        except Exception as exc:
+            log.debug("生成缩略图失败：%s", exc)
+            return None
+        try:
+            reply = await asyncio.wait_for(self._api_describe([thumb], self.BOX_PROMPT), 15)
+            match = re.search(r"\{.*\}", reply or "", re.S)
+            box = (json.loads(match.group(0)) if match else {}).get("box")
+            if not isinstance(box, list) or len(box) != 4:
+                return None
+            x0, y0, x1, y1 = (float(v) for v in box)
+            if not (0 <= x0 < x1 <= 1000 and 0 <= y0 < y1 <= 1000) or (x1 - x0) < 120 or (y1 - y0) < 120:
+                return None
+            return [x0, y0, x1, y1]
+        except Exception as exc:
+            log.debug("框出角色区域失败：%s", exc)
+            return None
+        finally:
+            try:
+                thumb.unlink()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _crop_original(path: Path, box: list[float], out: Path, margin: float = 0.12) -> bool:
+        """按框（千分比）加边距，从原始分辨率裁出一块；太小就放弃。"""
+        from PIL import Image
+        with Image.open(path) as image:
+            image.seek(0)
+            full = image.convert("RGB")
+            width, height = full.size
+            x0, y0, x1, y1 = box
+            pad_x, pad_y = (x1 - x0) * margin, (y1 - y0) * margin
+            left = max(0, int((x0 - pad_x) / 1000 * width))
+            top = max(0, int((y0 - pad_y) / 1000 * height))
+            right = min(width, int((x1 + pad_x) / 1000 * width))
+            bottom = min(height, int((y1 + pad_y) / 1000 * height))
+            if right - left < 300 or bottom - top < 300:
+                return False
+            full.crop((left, top, right, bottom)).save(out, "PNG")
+            return True
+
+    async def relook(self, path: Path) -> str:
+        """被指出认错后的再次仔细观察：先框出角色所在区域，按原始分辨率裁出来逐项描述；
+        框不出来就把整张图再仔细看一遍。失败返回空字符串。"""
+        if not self.enabled or not self._api_ready() or not path.exists():
+            return ""
+        temporary: list[Path] = []
+        try:
+            target = path
+            box = await self._character_box(path)
+            if box:
+                crop = self.work_dir / f"{uuid.uuid4().hex}.png"
+                temporary.append(crop)
+                if await asyncio.to_thread(self._crop_original, path, box, crop):
+                    target = crop
+            prepared, converted = await asyncio.to_thread(self._normalize_image, target)
+            if converted:
+                temporary.append(prepared)
+            return (await self._api_describe([prepared], self.RELOOK_PROMPT)).strip()
+        except Exception as exc:
+            log.warning("再次观察图片失败：%s", exc)
+            return ""
+        finally:
+            for item in temporary:
+                try:
+                    item.unlink()
+                except OSError:
+                    pass
 
     async def describe_frames(self, frames: list[Path], prompt: str) -> str:
         """把已经截好的几帧交给视觉模型；没配置视觉 API 时返回空。"""

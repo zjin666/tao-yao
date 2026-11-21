@@ -68,6 +68,20 @@ def malformed_tags(text: str) -> list[str]:
     return found
 
 
+# 方括号或【】里是“代码名词”（只有英文字母、数字、下划线、冒号等，且以字母或下划线开头：[user] [owner] [system] [id:12]），
+# 既不是我们定义的标签（合法标签在检查前已去掉），也不是聊天话语。纯数字（[1]）和中文内容（[笑]、【标题】）不算。
+_CODE_LIKE_TAG = re.compile(r"[\[【][ \t]*(?=[A-Za-z_])[A-Za-z0-9_ .:=/#\-]{1,40}[\]】]")
+# 群聊历史里每行开头的发言者标注：“昵称#1234：”
+_SPEAKER_LABEL = re.compile(r"(?:^|\n)[ \t]*[^\s：:\n]{1,24}#\d{4}[：:]")
+
+
+def unknown_tags(text: str) -> list[str]:
+    """回复里不是我们自己定义的“代码式”标记（如 [user]、昵称#1234：）。有就说明模型把输入里的格式抄进了回复，不能发出。"""
+    rest = strip_tags(text)
+    return [m.group(0).strip() for m in _CODE_LIKE_TAG.finditer(rest)] + [
+        m.group(0).strip() for m in _SPEAKER_LABEL.finditer(rest)]
+
+
 # ---------- 2. 输入里的标注 ----------
 VOICE = "[语音]"                   # 语音转成的文字，算对方自己的话
 IMAGE = "[图片内容]"
