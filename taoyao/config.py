@@ -295,8 +295,11 @@ DEFAULTS: dict[str, Any] = {
     },
     "relook": {
         "enabled": True,
-        "max_age_seconds": 1800,
-        "timeout_seconds": 45,
+        "candidate_max_age_seconds": 172800,
+        "timeout_seconds": 70,
+        "identify": True,
+        "identify_model": "qwen3.8-max",
+        "identify_timeout_seconds": 45,
     },
     "figure_memory": {
         "enabled": True,

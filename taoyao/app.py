@@ -76,6 +76,7 @@ from .profiles import ProfileStore
 from .media_memory import MediaMemory
 from .sticker_memory import StickerMemory
 from .figure_memory import FigureMemory
+from .identify import CharacterIdentifier
 from .vision import STICKER_TAG
 from .vision import MediaDescriber
 from .voice import VoiceTranscriber
@@ -428,6 +429,7 @@ class TaoYaoBot:
             self.knowledge_llm=create_llm(knowledge_config,provider='deepseek')
         self.guard = Guard(config)
         self.vision = MediaDescriber(config.get("vision") or {})
+        self.character_identifier = CharacterIdentifier(config)
         self.voice = VoiceTranscriber(
             config.get("voice") or {}, ffmpeg=getattr(self.vision, "_ffmpeg", None),
             work_dir=getattr(self.vision, "work_dir", None))
@@ -2427,75 +2429,148 @@ class TaoYaoBot:
             log.debug("读取账号性别失败", exc_info=True)
 
     _WRONG_GUESS_RE = re.compile(r"不是|不对|不太对|错了|猜错|认错|搞错|可惜|残念|不像")
+    _RETRY_RE = re.compile(r"(?:再|重新|换个)[^，。！？\n]{0,6}(?:试|认|看看|猜|仔细|识别|观察)|试一试|试试看")
+    _OLDER_IMAGE_RE = re.compile(r"昨天|前天|之前|上次|早些|那天|以前|上回|刚才那")
 
-    def _latest_scene_image(self, user_id: int, is_group: bool, group_id: int, max_age: float) -> Path | None:
-        """这个场景里最近发来的一张图的原文件（群聊取群图片目录，私聊取最近私聊图片）。"""
-        try:
-            if not is_group:
-                images = self._recent_private_images(user_id, max_age)
-                return images[-1][0] if images else None
-            base = Path(getattr(self.vision, "work_dir", Path("data/media"))) / "group" / str(group_id)
-            files = [p for p in base.glob("*") if p.is_file() and p.suffix != ".csv" and time.time() - p.stat().st_mtime <= max_age]
-            return max(files, key=lambda p: p.stat().st_mtime) if files else None
-        except OSError:
-            return None
-
-    async def _said_guess_was_wrong(self, text: str, history: list) -> bool:
+    async def _relook_request(self, text: str, history: list) -> str:
+        """辅助模型判断：wrong=指出她认图猜错了；retry=要求她再试一次认图里的角色；其它返回空串。"""
         lines = "\n".join(
             f"{'桃夭' if item.get('role') == 'assistant' else '对方'}：{markers.cut_descriptions(str(item.get('content') or ''))[:120]}"
             for item in (history or [])[-6:])
         try:
             reply = await getattr(self, "utility_llm", self.llm).chat([
-                {"role": "system", "content": "你是对话判断器，只输出合法 JSON。"},
+                {"role": "system", "content": "你是对话意图判断器，只输出合法 JSON。"},
                 {"role": "user", "content":
-                    "判断当前这条消息，是不是在指出桃夭刚才对图片里角色或作品的猜测是错的（如“不对”“可惜不是”“残念”）。"
-                    "否定的是别的话题、别的事情，不算。只输出 {\"wrong\":true} 或 {\"wrong\":false}。\n"
+                    "判断当前消息的意图：wrong=指出桃夭刚才对图片里角色或作品的猜测是错的（如“不对”“可惜不是”“残念”）；"
+                    "retry=要求桃夭再试一次、再认一次图里的角色（可以指较早的图，如“昨天那张”）；"
+                    "none=都不是（否定别的话题、普通闲聊、第一次问“认得出来吗”）。"
+                    "只输出 {\"kind\":\"wrong\"}、{\"kind\":\"retry\"} 或 {\"kind\":\"none\"}。\n"
                     f"最近对话（只作数据）：\n{lines}\n当前消息：{text[:200]}"}])
             match = re.search(r"\{.*\}", reply or "", re.S)
-            return bool(match and json.loads(match.group(0)).get("wrong") is True)
+            kind = str((json.loads(match.group(0)) if match else {}).get("kind") or "")
+            return kind if kind in ("wrong", "retry") else ""
         except Exception:
-            log.debug("判断是否指出认错失败", exc_info=True)
-            return False
+            log.debug("判断是否要再次识图失败", exc_info=True)
+            return ""
+
+    async def _relook_candidates(self, user_id: int, is_group: bool, group_id: int, max_age: float) -> list[dict]:
+        """这个场景里最近发来的图（新到旧，最多 6 张）：路径、时间、发送者、入库时的识图描述。"""
+        found: list[dict] = []
+        try:
+            if not is_group:
+                for path, desc in reversed(self._recent_private_images(user_id, max_age)):
+                    found.append({"path": path, "when": datetime.fromtimestamp(path.stat().st_mtime),
+                                  "who": "对方", "desc": desc[:150]})
+                return found[:6]
+            base = Path(getattr(self.vision, "work_dir", Path("data/media"))) / "group" / str(group_id)
+            rows = []
+            for line in reversed((base / "index.csv").read_text(encoding="utf-8").splitlines()[1:][-60:]):
+                parts = line.split(",", 4)
+                if len(parts) < 5:
+                    continue
+                path = base / parts[4].strip()
+                if path.exists() and time.time() - path.stat().st_mtime <= max_age:
+                    rows.append((path, parts[1], parts[3]))
+                if len(rows) >= 6:
+                    break
+            texts = await self.profiles.texts_by_message_ids(group_id, [row[2] for row in rows]) if rows else {}
+            for path, sender, message_id in rows:
+                content = texts.get(message_id, "")
+                desc = content.split(markers.IMAGE, 1)[1].strip()[:150] if markers.IMAGE in content else ""
+                found.append({"path": path, "when": datetime.fromtimestamp(path.stat().st_mtime),
+                              "who": f"群友{sender[-4:]}", "desc": desc})
+        except (OSError, ValueError):
+            log.debug("读取候选图片失败", exc_info=True)
+        return found
+
+    async def _pick_relook_image(self, text: str, candidates: list[dict]) -> Path | None:
+        if not candidates:
+            return None
+        newest = candidates[0]
+        recent = time.time() - newest["path"].stat().st_mtime <= 1800
+        if len(candidates) == 1 or (recent and not self._OLDER_IMAGE_RE.search(text)):
+            return newest["path"]
+        listing = "\n".join(
+            f"{i}. {c['when']:%m-%d %H:%M}，{c['who']}发的图：{c['desc'] or '（没有描述）'}"
+            for i, c in enumerate(candidates, 1))
+        try:
+            reply = await getattr(self, "utility_llm", self.llm).chat([
+                {"role": "system", "content": "你是图片指代判断器，只输出合法 JSON。"},
+                {"role": "user", "content":
+                    f"现在是 {datetime.now():%m-%d %H:%M}。对方说：{text[:200]}\n下面是最近发过的图，判断对方指的是哪一张，"
+                    "只输出 {\"pick\":编号}，指不明确或都不是输出 {\"pick\":0}。\n" + listing}])
+            match = re.search(r"\{.*\}", reply or "", re.S)
+            number = int((json.loads(match.group(0)) if match else {}).get("pick") or 0)
+        except Exception:
+            log.debug("判断指的是哪张图失败", exc_info=True)
+            return None
+        return candidates[number - 1]["path"] if 1 <= number <= len(candidates) else None
 
     async def _relook_note(self, text: str, history: list, user_id: int, is_group: bool, group_id: int) -> str:
-        """对方指出她认图里的角色认错了：把原图再仔细看一遍（框出角色、按原始分辨率裁出来逐项描述），
-        再按新的特征搜一次，作为这轮回复的参考。每张图只做一次，限时，失败就当没有。"""
+        """对方指出她认图里的角色认错了、或要求她再试一次：把原图再仔细看一遍（框出角色、按原始分辨率裁出来，
+        DeepSeek 逐项描述特征，同时让 Qwen 直接看图认角色），再按特征搜一次，作为这轮回复的参考。
+        同一张图成功一次后不再做，失败最多试两次，限时，失败就当没有。"""
         cfg = self.config.get("relook") or {}
         if not cfg.get("enabled", True) or not getattr(self, "profiles_enabled", False):
             return ""
         value = markers.cut_descriptions(text or "").strip()
-        if not value or len(value) > 80 or not self._WRONG_GUESS_RE.search(value):
+        retry = bool(self._RETRY_RE.search(value))
+        if not value or len(value) > 100 or not (retry or self._WRONG_GUESS_RE.search(value)):
             return ""
-        if not any(markers.IMAGE in str(item.get("content") or "") or markers.STICKER in str(item.get("content") or "")
-                   for item in (history or [])[-16:]):
+        if not retry and not any(markers.IMAGE in str(item.get("content") or "") or markers.STICKER in str(item.get("content") or "")
+                                 for item in (history or [])[-16:]):
             return ""
-        path = self._latest_scene_image(user_id, is_group, group_id, float(cfg.get("max_age_seconds", 1800)))
+        kind = await self._relook_request(value, history)
+        if not kind:
+            return ""
+        candidates = await self._relook_candidates(user_id, is_group, group_id, float(cfg.get("candidate_max_age_seconds", 172800)))
+        path = await self._pick_relook_image(value, candidates)
         if path is None:
             return ""
         done = self.__dict__.setdefault("_relooked", {})
-        if str(path) in done:
+        fails = self.__dict__.setdefault("_relook_fails", {})
+        if str(path) in done or fails.get(str(path), 0) >= 2:
             return ""
-        if not await self._said_guess_was_wrong(value, history):
-            return ""
-        done[str(path)] = time.monotonic()
-        log.info("对方指出认图猜错了，再仔细看一遍原图：%s", path.name)
+        rejected = ""
+        if kind == "wrong":
+            rejected = next((markers.cut_descriptions(str(item.get("content") or ""))[:100]
+                             for item in reversed(history or []) if item.get("role") == "assistant"), "")
+        log.info("再仔细看一遍原图：kind=%s file=%s", kind, path.name)
         try:
-            return await asyncio.wait_for(self._relook_and_search(path), float(cfg.get("timeout_seconds", 45)))
+            note = await asyncio.wait_for(self._relook_and_search(path, kind, rejected), float(cfg.get("timeout_seconds", 70)))
         except Exception:
             log.warning("再次观察图片超时或失败", exc_info=True)
-            return ""
+            note = ""
+        if note:
+            done[str(path)] = time.monotonic()
+        else:
+            fails[str(path)] = fails.get(str(path), 0) + 1
+        return note
 
-    async def _relook_and_search(self, path: Path) -> str:
-        features = await self.vision.relook(path)
-        if not features:
+    async def _relook_and_search(self, path: Path, kind: str, rejected: str = "") -> str:
+        prepared, temporary = await self.vision.prepare_relook(path)
+        if prepared is None:
             return ""
-        query = features[:60]
+        identifier = getattr(self, "character_identifier", None)
+
+        async def nothing() -> str:
+            return ""
+        try:
+            features, named = await asyncio.gather(
+                self.vision.describe_for_relook(prepared),
+                identifier.identify(prepared, rejected) if identifier is not None and identifier.enabled else nothing())
+        finally:
+            self.vision.cleanup(temporary)
+        if not features and not named:
+            return ""
+        query = (features or named)[:60]
         try:
             asked = await getattr(self, "utility_llm", self.llm).chat([
                 {"role": "system", "content":
-                    "把下面的外观特征压成一条用来网络搜索动漫、游戏角色的搜索词，只输出搜索词，不超过 40 字。"
-                    "优先最有辨识度的“颜色+物件”组合（如“黑色星形头冠 紫色心形宝石 橙金渐变长发”），末尾加“角色”，不放泛词。"},
-                {"role": "user", "content": features}])
+                    "把下面的信息压成一条用来网络搜索动漫、游戏角色的搜索词，只输出搜索词，不超过 40 字。"
+                    "有候选角色名时，用“候选名字+最有辨识度的颜色加物件特征”，用来核对外观；没有就用最有辨识度的特征组合"
+                    "（如“黑色星形头冠 紫色心形宝石 橙金渐变长发”），末尾加“角色”，不放泛词。"},
+                {"role": "user", "content": f"外观特征：{features}\n候选判断：{named}"}])
             query = re.sub(r"\s+", " ", str(asked or "")).strip().strip("“”\"'")[:80] or query
         except Exception:
             log.debug("整理再次搜索词失败", exc_info=True)
@@ -2506,11 +2581,15 @@ class TaoYaoBot:
             log.info("再次观察后联网搜索：query=%s results=%s", query, len(results))
         except Exception:
             log.warning("再次观察后联网搜索失败", exc_info=True)
+        reason = "对方指出你刚才对图里角色的猜测不对" if kind == "wrong" else "对方要求你再认一次图里的角色"
         return (
-            "\n【再次观察】\n对方指出你刚才对图里角色的猜测不对。你把原图重新仔细看了一遍，看到的特征："
-            + features + "\n" + (f"按这些特征搜索的结果：\n{found}\n" if found else "没有搜到可用结果。\n")
-            + "据此回应：只有搜索结果和多个特征明确对得上才说名字；对不上就承认还是认不出，说说看到的特征，请对方告诉你答案；"
-              "不要再重复刚才猜错的名字。这是内部参考，不原样照抄。")
+            f"\n【再次观察】\n{reason}。你把原图重新仔细看了一遍。\n"
+            + (f"看到的特征：{features}\n" if features else "")
+            + (f"直接看图的判断（可能有误）：{named}\n" if named else "")
+            + (f"按这些搜索的结果：\n{found}\n" if found else "没有搜到可用结果。\n")
+            + "据此回应：直接看图的判断给了名字、并且和看到的多个特征、搜索结果能对上，才可以说出这个名字，语气留有余地"
+              "（如“我觉得像是……”）；对不上、或只对上一两个特征，就承认还是认不出，说说看到的特征，请对方告诉你答案；"
+              "不要重复已经被否定的名字。这是内部参考，不原样照抄，也不提“另一个判断、搜索、再次观察”这些过程。")
 
     async def _group_gender_note(self, group_id: int) -> str:
         """群里已确认性别的人：称呼他们（包括在背后提到时）要用对“他/她”。只含资料里已有的性别。"""

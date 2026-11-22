@@ -868,6 +868,20 @@ class ProfileStore:
         ).fetchone()
         return str(row["summary"]) if row else ""
 
+    def _texts_by_message_ids(self, group_id: int, message_ids: list[str]) -> dict[str, str]:
+        ids = [str(item) for item in message_ids if str(item)]
+        if not ids:
+            return {}
+        marks = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            f"SELECT message_id, content FROM user_messages WHERE scene='group' AND group_id=? "
+            f"AND message_id IN ({marks})", (int(group_id), *ids)).fetchall()
+        return {str(row["message_id"]): str(row["content"]) for row in rows}
+
+    async def texts_by_message_ids(self, group_id: int, message_ids: list[str]) -> dict[str, str]:
+        """群消息 id → 入库时的文字（含当时的识图描述）。用来在一堆旧图里认出对方指的是哪张。"""
+        return await self._run(self._texts_by_message_ids, int(group_id or 0), list(message_ids))
+
     def _group_genders(self, group_id: int, limit: int) -> list[tuple[str, str]]:
         rows = self._conn.execute(
             "SELECT p.user_id, p.nickname, p.basic_info, p.basic_info_group FROM profiles p "

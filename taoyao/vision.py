@@ -478,12 +478,12 @@ class MediaDescriber:
             full.crop((left, top, right, bottom)).save(out, "PNG")
             return True
 
-    async def relook(self, path: Path) -> str:
-        """被指出认错后的再次仔细观察：先框出角色所在区域，按原始分辨率裁出来逐项描述；
-        框不出来就把整张图再仔细看一遍。失败返回空字符串。"""
-        if not self.enabled or not self._api_ready() or not path.exists():
-            return ""
+    async def prepare_relook(self, path: Path) -> tuple[Path | None, list[Path]]:
+        """再次观察用的图：先框出角色所在区域，按原始分辨率裁出来再压到可上传大小；框不出来就用整张图。
+        返回（图, 用完要删的临时文件）；不可用返回 (None, [])。"""
         temporary: list[Path] = []
+        if not self.enabled or not self._api_ready() or not path.exists():
+            return None, temporary
         try:
             target = path
             box = await self._character_box(path)
@@ -495,16 +495,34 @@ class MediaDescriber:
             prepared, converted = await asyncio.to_thread(self._normalize_image, target)
             if converted:
                 temporary.append(prepared)
+            return prepared, temporary
+        except Exception as exc:
+            log.warning("准备再次观察的图片失败：%s", exc)
+            return None, temporary
+
+    @staticmethod
+    def cleanup(files: list[Path]) -> None:
+        for item in files:
+            try:
+                item.unlink()
+            except OSError:
+                pass
+
+    async def describe_for_relook(self, prepared: Path) -> str:
+        """对准备好的图逐项写出辨识特征（不猜名字）。"""
+        try:
             return (await self._api_describe([prepared], self.RELOOK_PROMPT)).strip()
         except Exception as exc:
             log.warning("再次观察图片失败：%s", exc)
             return ""
+
+    async def relook(self, path: Path) -> str:
+        """被指出认错后的再次仔细观察：裁出角色区域逐项描述。失败返回空字符串。"""
+        prepared, temporary = await self.prepare_relook(path)
+        try:
+            return await self.describe_for_relook(prepared) if prepared else ""
         finally:
-            for item in temporary:
-                try:
-                    item.unlink()
-                except OSError:
-                    pass
+            self.cleanup(temporary)
 
     async def describe_frames(self, frames: list[Path], prompt: str) -> str:
         """把已经截好的几帧交给视觉模型；没配置视觉 API 时返回空。"""
