@@ -29,6 +29,8 @@ class PromptTests(unittest.TestCase):
         prompt = build_system_prompt("人设", [], role="owner")
         self.assertIn("认不出就直说认不出", prompt)
         self.assertIn("不把猜测说成“太眼熟了”", prompt)
+        self.assertIn("不说“绝对是、肯定是”", prompt)
+        self.assertIn("搜到某个角色的资料只说明有这个角色，不证明图里就是她", build_system_prompt("人设", [], role="owner", search_context="某角色资料"))
 
     def test_image_prompt_asks_for_identifying_details_but_not_a_guessed_name(self):
         for word in ("发色（含渐变）", "头饰和配饰的真实形状", "窗口标题栏或软件名", "不要猜具体的角色名或作品名"):

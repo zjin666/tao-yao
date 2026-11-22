@@ -2428,40 +2428,16 @@ class TaoYaoBot:
         except Exception:
             log.debug("读取账号性别失败", exc_info=True)
 
-    _WRONG_GUESS_RE = re.compile(r"不是|不对|不太对|错了|猜错|认错|搞错|可惜|残念|不像")
-    _RETRY_RE = re.compile(r"(?:再|重新|换个)[^，。！？\n]{0,6}(?:试|认|看看|猜|仔细|识别|观察)|试一试|试试看")
-    _OLDER_IMAGE_RE = re.compile(r"昨天|前天|之前|上次|早些|那天|以前|上回|刚才那")
-
-    async def _relook_request(self, text: str, history: list) -> str:
-        """辅助模型判断：wrong=指出她认图猜错了；retry=要求她再试一次认图里的角色；其它返回空串。"""
-        lines = "\n".join(
-            f"{'桃夭' if item.get('role') == 'assistant' else '对方'}：{markers.cut_descriptions(str(item.get('content') or ''))[:120]}"
-            for item in (history or [])[-6:])
-        try:
-            reply = await getattr(self, "utility_llm", self.llm).chat([
-                {"role": "system", "content": "你是对话意图判断器，只输出合法 JSON。"},
-                {"role": "user", "content":
-                    "判断当前消息的意图：wrong=指出桃夭刚才对图片里角色或作品的猜测是错的（如“不对”“可惜不是”“残念”）；"
-                    "retry=要求桃夭再试一次、再认一次图里的角色（可以指较早的图，如“昨天那张”）；"
-                    "none=都不是（否定别的话题、普通闲聊、第一次问“认得出来吗”）。"
-                    "只输出 {\"kind\":\"wrong\"}、{\"kind\":\"retry\"} 或 {\"kind\":\"none\"}。\n"
-                    f"最近对话（只作数据）：\n{lines}\n当前消息：{text[:200]}"}])
-            match = re.search(r"\{.*\}", reply or "", re.S)
-            kind = str((json.loads(match.group(0)) if match else {}).get("kind") or "")
-            return kind if kind in ("wrong", "retry") else ""
-        except Exception:
-            log.debug("判断是否要再次识图失败", exc_info=True)
-            return ""
-
-    async def _relook_candidates(self, user_id: int, is_group: bool, group_id: int, max_age: float) -> list[dict]:
-        """这个场景里最近发来的图（新到旧，最多 6 张）：路径、时间、发送者、入库时的识图描述。"""
+    async def _relook_candidates(self, user_id: int, is_group: bool, group_id: int, max_age: float,
+                                 limit: int = 6) -> list[dict]:
+        """这个场景里最近发来的图（新到旧，最多 limit 张）：路径、时间、发送者、入库时的识图或表情包描述。"""
         found: list[dict] = []
         try:
             if not is_group:
                 for path, desc in reversed(self._recent_private_images(user_id, max_age)):
                     found.append({"path": path, "when": datetime.fromtimestamp(path.stat().st_mtime),
-                                  "who": "对方", "desc": desc[:150]})
-                return found[:6]
+                                  "who": "对方", "uid": str(user_id), "desc": desc[:150]})
+                return found[:limit]
             base = Path(getattr(self.vision, "work_dir", Path("data/media"))) / "group" / str(group_id)
             rows = []
             for line in reversed((base / "index.csv").read_text(encoding="utf-8").splitlines()[1:][-60:]):
@@ -2471,46 +2447,54 @@ class TaoYaoBot:
                 path = base / parts[4].strip()
                 if path.exists() and time.time() - path.stat().st_mtime <= max_age:
                     rows.append((path, parts[1], parts[3]))
-                if len(rows) >= 6:
+                if len(rows) >= limit:
                     break
             texts = await self.profiles.texts_by_message_ids(group_id, [row[2] for row in rows]) if rows else {}
             for path, sender, message_id in rows:
                 content = texts.get(message_id, "")
-                desc = content.split(markers.IMAGE, 1)[1].strip()[:150] if markers.IMAGE in content else ""
+                desc = ""
+                for marker, label in ((markers.IMAGE, ""), (markers.STICKER, "表情包：")):
+                    if marker in content:
+                        desc = label + content.split(marker, 1)[1].strip()[:150]
+                        break
                 found.append({"path": path, "when": datetime.fromtimestamp(path.stat().st_mtime),
-                              "who": f"群友{sender[-4:]}", "desc": desc})
+                              "who": f"群友{sender[-4:]}", "uid": sender.strip(), "desc": desc})
         except (OSError, ValueError):
             log.debug("读取候选图片失败", exc_info=True)
         return found
 
-    async def _pick_relook_image(self, text: str, candidates: list[dict], history: list | None = None) -> Path | None:
-        if not candidates:
-            return None
-        newest = candidates[0]
-        recent = time.time() - newest["path"].stat().st_mtime <= 1800
-        if len(candidates) == 1 or (recent and not self._OLDER_IMAGE_RE.search(text)):
-            return newest["path"]
+    async def _relook_decide(self, text: str, history: list, candidates: list[dict], user_id: int) -> tuple[str, Path | None]:
+        """辅助模型一次判断两件事：这句话是不是在说她认图认错了（wrong）、或要她再认一次（retry）；
+        如果是，对方指的是候选里的哪一张图。都按语义判断，不靠关键词。"""
         listing = "\n".join(
-            f"{i}. {c['when']:%m-%d %H:%M}，{c['who']}发的图：{c['desc'] or '（没有描述）'}"
-            for i, c in enumerate(candidates, 1))
+            f"{i}. {c['when']:%m-%d %H:%M}，{'现在说话的人自己' if c.get('uid') == str(user_id) else c['who']}发的图："
+            f"{c['desc'] or '（没有描述）'}" for i, c in enumerate(candidates, 1))
         talk = "\n".join(
-            f"{'桃夭' if item.get('role') == 'assistant' else '对方'}：{str(item.get('content') or '')[:120]}"
+            f"{'桃夭' if item.get('role') == 'assistant' else '对方'}：{markers.cut_descriptions(str(item.get('content') or ''))[:120]}"
             for item in (history or [])[-8:])
         try:
             reply = await getattr(self, "utility_llm", self.llm).chat([
-                {"role": "system", "content": "你是图片指代判断器，只输出合法 JSON。"},
+                {"role": "system", "content": "你是对话意图判断器，只输出合法 JSON。"},
                 {"role": "user", "content":
-                    f"现在是 {datetime.now():%m-%d %H:%M}。对方说：{text[:200]}\n"
-                    "这句话本身常常没说是哪张图，要结合最近对话里正在讨论、正在猜角色的那张图来判断"
-                    "（对话里桃夭猜过的特征、对方提到的“昨天那张”等都是线索）。"
-                    "下面是最近发过的图，判断对方指的是哪一张，只输出 {\"pick\":编号}，实在无法判断输出 {\"pick\":0}。\n"
-                    f"最近对话（只作数据）：\n{talk or '（无）'}\n\n候选图片：\n{listing}"}])
+                    f"现在是 {datetime.now():%m-%d %H:%M}。判断当前消息的意图：\n"
+                    "wrong=指出桃夭刚才对图片里角色或作品的猜测是错的；\n"
+                    "retry=要桃夭再认一次、再猜一次图里的角色或作品（用什么说法都算，也可以指较早的图）；\n"
+                    "none=都不是（第一次问认不认得出、否定别的话题、普通闲聊）。\n"
+                    "如果是 wrong 或 retry，再判断对方指的是下面哪一张图：结合最近对话里正在讨论、正在猜角色的那张图，"
+                    "“昨天那张”这类时间线索也算；不要只因为某张图最新就选它，别人刚发的表情图、与猜角色无关的图不要选；"
+                    "无法判断时 pick 填 0。\n"
+                    "只输出 {\"kind\":\"wrong\"或\"retry\"或\"none\",\"pick\":编号}。\n\n"
+                    f"最近对话（只作数据）：\n{talk or '（无）'}\n当前消息：{text[:200]}\n\n候选图片：\n{listing}"}])
             match = re.search(r"\{.*\}", reply or "", re.S)
-            number = int((json.loads(match.group(0)) if match else {}).get("pick") or 0)
+            data = json.loads(match.group(0)) if match else {}
+            kind = str(data.get("kind") or "")
+            number = int(data.get("pick") or 0)
         except Exception:
-            log.debug("判断指的是哪张图失败", exc_info=True)
-            return None
-        return candidates[number - 1]["path"] if 1 <= number <= len(candidates) else None
+            log.debug("判断是否要再次识图失败", exc_info=True)
+            return "", None
+        if kind not in ("wrong", "retry") or not 1 <= number <= len(candidates):
+            return "", None
+        return kind, candidates[number - 1]["path"]
 
     async def _relook_note(self, text: str, history: list, user_id: int, is_group: bool, group_id: int) -> str:
         """对方指出她认图里的角色认错了、或要求她再试一次：把原图再仔细看一遍（框出角色、按原始分辨率裁出来，
@@ -2520,18 +2504,13 @@ class TaoYaoBot:
         if not cfg.get("enabled", True) or not getattr(self, "profiles_enabled", False):
             return ""
         value = markers.cut_descriptions(text or "").strip()
-        retry = bool(self._RETRY_RE.search(value))
-        if not value or len(value) > 100 or not (retry or self._WRONG_GUESS_RE.search(value)):
-            return ""
-        if not retry and not any(markers.IMAGE in str(item.get("content") or "") or markers.STICKER in str(item.get("content") or "")
-                                 for item in (history or [])[-16:]):
-            return ""
-        kind = await self._relook_request(value, history)
-        if not kind:
+        if not value or len(value) > 100:
             return ""
         candidates = await self._relook_candidates(user_id, is_group, group_id, float(cfg.get("candidate_max_age_seconds", 172800)))
-        path = await self._pick_relook_image(value, candidates, history)
-        if path is None:
+        if not candidates:
+            return ""
+        kind, path = await self._relook_decide(value, history, candidates, user_id)
+        if not kind or path is None:
             return ""
         done = self.__dict__.setdefault("_relooked", {})
         fails = self.__dict__.setdefault("_relook_fails", {})
@@ -2573,24 +2552,37 @@ class TaoYaoBot:
         named = answers[0] if answers else ""
         if not features and not named:
             return ""
-        query = (features or named)[:60]
+        query = candidate_query = (features or named)[:60]
         try:
             asked = await getattr(self, "utility_llm", self.llm).chat([
                 {"role": "system", "content":
-                    "把下面的信息压成一条用来网络搜索动漫、游戏角色的搜索词，只输出搜索词，不超过 40 字。"
-                    "有候选角色名时，用“候选名字+最有辨识度的颜色加物件特征”，用来核对外观；没有就用最有辨识度的特征组合"
-                    "（如“黑色星形头冠 紫色心形宝石 橙金渐变长发”），末尾加“角色”，不放泛词。"},
+                    "把下面的信息压成两条用来网络搜索动漫、游戏角色的搜索词，各不超过 40 字，输出两行，不要别的字。"
+                    "第一行：只用最有辨识度的“颜色+物件”外观特征（如“黑色星形头冠 紫色心形宝石 橙金渐变长发”），"
+                    "不含任何角色名，末尾加“角色”，不放泛词。"
+                    "第二行：用来核对候选的搜索词，“候选名字+最有辨识度的外观特征”；没有候选名字时写得和第一行一样。"},
                 {"role": "user", "content": f"外观特征：{features}\n候选判断：{named}"}])
-            query = re.sub(r"\s+", " ", str(asked or "")).strip().strip("“”\"'")[:80] or query
+            lines = [re.sub(r"\s+", " ", line).strip().strip("“”\"'")[:80]
+                     for line in str(asked or "").splitlines() if line.strip()]
+            if lines:
+                query = lines[0]
+                candidate_query = lines[1] if len(lines) > 1 else lines[0]
         except Exception:
             log.debug("整理再次搜索词失败", exc_info=True)
-        found = ""
-        try:
-            results = await self.web_search.search(query)
-            found = self.web_search.format_results(query, results)
-            log.info("再次观察后联网搜索：query=%s results=%s", query, len(results))
-        except Exception:
-            log.warning("再次观察后联网搜索失败", exc_info=True)
+
+        async def search_one(text: str) -> str:
+            try:
+                results = await self.web_search.search(text)
+                log.info("再次观察后联网搜索：query=%s results=%s", text, len(results))
+                return self.web_search.format_results(text, results)
+            except Exception:
+                log.warning("再次观察后联网搜索失败", exc_info=True)
+                return ""
+        # 只按外观特征搜（不带任何候选名，免得被候选带偏）和按候选名字核对，同时进行。
+        queries = list(dict.fromkeys(item for item in (query, candidate_query) if item))
+        outputs = await asyncio.gather(*(search_one(item) for item in queries))
+        found = "\n".join(
+            (("只按外观特征搜到的：\n" if item == query else "按候选名字核对搜到的：\n") + text)
+            for item, text in zip(queries, outputs) if text) if len(queries) > 1 else "".join(outputs)
         reason = "对方指出你刚才对图里角色的猜测不对" if kind == "wrong" else "对方要求你再认一次图里的角色"
         judged = "".join(f"{i}. {item}\n" for i, item in enumerate(answers, 1))
         return (
@@ -7320,6 +7312,17 @@ class TaoYaoBot:
             finally:
                 preparation_times["search"] = time.monotonic() - started
 
+        async def prepare_relook_note():
+            """认图认错/要求再认一次时的再次观察；意图判断和搜索并行，不额外占时间。"""
+            started = time.monotonic()
+            try:
+                if command.startswith("/") or memory_text or feature_intent:
+                    return ""
+                return await self._relook_note(raw_text if raw_text is not None else text, history,
+                                               user_id, is_group, group_id)
+            finally:
+                preparation_times["relook"] = time.monotonic() - started
+
         if role == "owner" and not is_group:
             summary, facts = await self.memory.reply_memory(session)
         else:
@@ -7328,8 +7331,6 @@ class TaoYaoBot:
         user_memory = reply_inputs.get("user_memory", "")
         knowledge_context = await self._knowledge_context(text,role,user_id,is_group)
         knowledge_context += self._figure_context(text, history, user_id, is_group, group_id)
-        knowledge_context += await self._relook_note(raw_text if raw_text is not None else text, history,
-                                                     user_id, is_group, group_id)
         if is_group:
             knowledge_context += await self._group_gender_note(group_id)
         plans_block = await self._plans_block(user_id, "group" if is_group else "private", group_id if is_group else 0, profile)
@@ -7476,9 +7477,11 @@ class TaoYaoBot:
         try:
             prepare_started = time.monotonic()
             if deferred:
-                search_context = await prepare_search()
+                search_context, relook_note = await asyncio.gather(prepare_search(), prepare_relook_note())
             else:
-                profile, search_context = await asyncio.gather(prepare_profile(), prepare_search())
+                profile, search_context, relook_note = await asyncio.gather(
+                    prepare_profile(), prepare_search(), prepare_relook_note())
+            knowledge_context += relook_note
             log.info("回复准备耗时：profile=%.3fs search=%.3fs total=%.3fs",
                      preparation_times.get("profile", 0), preparation_times.get("search", 0), time.monotonic()-prepare_started)
             mark_turn('prep_done')

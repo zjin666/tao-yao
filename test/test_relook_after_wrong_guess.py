@@ -18,7 +18,7 @@ HISTORY = [{"role": "user", "content": "[群友] 现在能不能认出来\n[图�
            {"role": "assistant", "content": "是东方Project里的爱丽丝吧？"}]
 
 
-def make_group(tmp, ages=(60,)):
+def make_group(tmp, ages=(60,), uids=None):
     """在群 1 的图片目录里放若干张图（ages 是各自多少秒前发的，新到旧排列写进 index.csv）。"""
     base = Path(tmp) / "group" / "1"
     base.mkdir(parents=True)
@@ -28,20 +28,21 @@ def make_group(tmp, ages=(60,)):
         path = base / f"2026112{i}-000000_7000{i}_m{i}.bin"
         Image.new("RGB", (400, 300), (200, 200, 50)).save(path, "PNG")
         os.utime(path, (time.time() - age, time.time() - age))
-        lines.append(f"2026112{i}-000000,7000{i},1,m{i},{path.name}")
+        sender = uids[i] if uids else f"7000{i}"
+        lines.append(f"2026112{i}-000000,{sender},1,m{i},{path.name}")
         paths.append(path)
     (base / "index.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return paths
 
 
-def relook_bot(tmp, judge='{"kind":"wrong"}', features="橙金渐变长发，黑色星形头冠，紫色心形宝石", named="像荧（原神）",
-               ages=(60,), extra_chat=()):
+def relook_bot(tmp, judge='{"kind":"wrong","pick":1}', features="橙金渐变长发，黑色星形头冠，紫色心形宝石", named="像荧（原神）",
+               ages=(60,), extra_chat=(), uids=None):
     bot = TaoYaoBot.__new__(TaoYaoBot)
     bot.config = {"relook": {"timeout_seconds": 5}}
     bot.profiles_enabled = True
     bot.profiles = SimpleNamespace(texts_by_message_ids=AsyncMock(return_value={
         "m0": "[群友] 图\n[图片内容] 昨天那张：金发少女", "m1": "[群友] 图\n[图片内容] 今天这张：猫"}))
-    paths = make_group(tmp, ages)
+    paths = make_group(tmp, ages, uids)
     prepared = Path(tmp) / "prepared.jpg"
     prepared.write_bytes(b"x")
     bot.vision = SimpleNamespace(work_dir=Path(tmp), prepare_relook=AsyncMock(return_value=(prepared, [])),
@@ -61,7 +62,7 @@ class WrongGuessTests(unittest.IsolatedAsyncioTestCase):
             note = await bot._relook_note("可惜不是", HISTORY, 7, True, 1)
             self.assertIn("【再次观察】", note)
             self.assertIn("黑色星形头冠", note)              # DeepSeek 逐项描述的特征
-            self.assertIn("1. 像荧（原神）", note)                 # Qwen 直接看图，问了两次
+            self.assertIn("1. 像荧（原神）", note)             # Qwen 直接看图，问了两次
             self.assertIn("2. 像荧（原神）", note)
             self.assertIn("1. 某角色", note)                  # 搜索结果
             self.assertIn("不要重复已经被否定的名字", note)
@@ -72,10 +73,22 @@ class WrongGuessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_the_same_image_is_only_looked_at_again_once_after_it_worked(self):
         with tempfile.TemporaryDirectory() as tmp:
-            bot, _ = relook_bot(tmp)
+            bot, _ = relook_bot(tmp, extra_chat=("x",))
+            bot.utility_llm.chat = AsyncMock(side_effect=['{"kind":"wrong","pick":1}', "搜索词", '{"kind":"wrong","pick":1}'])
             await bot._relook_note("可惜不是", HISTORY, 7, True, 1)
             self.assertEqual(await bot._relook_note("还是不对", HISTORY, 7, True, 1), "")
             self.assertEqual(bot.character_identifier.identify.await_count, 2)      # 只有第一次做了（问两次）
+
+    async def test_it_searches_by_features_alone_and_by_candidate_at_the_same_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bot, _ = relook_bot(tmp)
+            bot.utility_llm.chat = AsyncMock(side_effect=[
+                '{"kind":"wrong","pick":1}', "黑色星形头冠 紫色宝石 金发 角色" + chr(10) + "荧 原神 黑色星形头冠"])
+            note = await bot._relook_note("可惜不是", HISTORY, 7, True, 1)
+            asked = sorted(call.args[0] for call in bot.web_search.search.await_args_list)
+            self.assertEqual(asked, ["荧 原神 黑色星形头冠", "黑色星形头冠 紫色宝石 金发 角色"])     # 一条不带名字，一条带候选名字
+            self.assertIn("只按外观特征搜到的：", note)
+            self.assertIn("按候选名字核对搜到的：", note)
 
     async def test_without_a_qwen_answer_the_note_still_has_the_features(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -84,60 +97,69 @@ class WrongGuessTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("黑色星形头冠", note)
             self.assertNotIn("直接看图的判断（可能有误", note)
 
-    async def test_nothing_happens_for_ordinary_talk_the_first_question_or_a_no_from_the_judge(self):
+    async def test_the_model_decides_by_meaning_and_nothing_happens_when_it_says_no(self):
+        for judge in ('{"kind":"none","pick":0}', '{"kind":"wrong","pick":0}', "不是json"):
+            with tempfile.TemporaryDirectory() as tmp:
+                bot, _ = relook_bot(tmp, judge=judge)
+                self.assertEqual(await bot._relook_note("你认得出来吗", HISTORY, 7, True, 1), "", judge)
+                bot.character_identifier.identify.assert_not_awaited()
+
+    async def test_candidates_carry_the_image_or_sticker_description_so_the_model_can_tell_them_apart(self):
         with tempfile.TemporaryDirectory() as tmp:
-            bot, _ = relook_bot(tmp)
-            self.assertEqual(await bot._relook_note("你认得出来吗", HISTORY, 7, True, 1), "")      # 第一次问：不触发
-            self.assertEqual(await bot._relook_note("哈哈好看", HISTORY, 7, True, 1), "")
-            self.assertEqual(await bot._relook_note("可惜不是", [{"role": "user", "content": "你好"}], 7, True, 1), "")
+            bot, paths = relook_bot(tmp, ages=(100, 50))
+            bot.profiles.texts_by_message_ids = AsyncMock(return_value={
+                "m0": "[群友] 图\n[图片内容] 猜图题：粉发少女", "m1": "[群友] 图\n[表情包内容] 形象：蓝发女仆"})
+            candidates = await bot._relook_candidates(7, True, 1, 3600, limit=5)
+            self.assertEqual([c["desc"] for c in candidates], ["表情包：形象：蓝发女仆", "猜图题：粉发少女"])   # 新到旧
+            self.assertEqual(len(await bot._relook_candidates(7, True, 1, 3600, limit=1)), 1)
+
+    async def test_without_any_saved_image_no_model_is_even_asked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bot, _ = relook_bot(tmp, ages=(10 ** 7,))
+            self.assertEqual(await bot._relook_note("再试一试", HISTORY, 7, True, 1), "")
             bot.utility_llm.chat.assert_not_awaited()
-            bot.character_identifier.identify.assert_not_awaited()
-        with tempfile.TemporaryDirectory() as tmp:
-            bot, _ = relook_bot(tmp, judge='{"kind":"none"}')
-            self.assertEqual(await bot._relook_note("不是在说这个", HISTORY, 7, True, 1), "")
-            bot.character_identifier.identify.assert_not_awaited()
+            bot.vision.prepare_relook.assert_not_awaited()
 
     async def test_failures_are_retried_at_most_twice_and_never_break_the_reply(self):
         with tempfile.TemporaryDirectory() as tmp:
-            bot, _ = relook_bot(tmp, features="", named="", extra_chat=())
-            bot.utility_llm.chat = AsyncMock(return_value='{"kind":"wrong"}')
+            bot, _ = relook_bot(tmp, features="", named="")
+            bot.utility_llm.chat = AsyncMock(return_value='{"kind":"wrong","pick":1}')
             for _ in range(4):
                 self.assertEqual(await bot._relook_note("可惜不是", HISTORY, 7, True, 1), "")
             self.assertEqual(bot.vision.describe_for_relook.await_count, 2)
 
 
 class RetryRequestTests(unittest.IsolatedAsyncioTestCase):
-    async def test_a_retry_request_works_without_any_correction_word_and_picks_the_older_image(self):
+    async def test_any_wording_of_asking_again_works_and_the_model_can_pick_an_older_image(self):
         with tempfile.TemporaryDirectory() as tmp:
-            bot, paths = relook_bot(tmp, judge='{"kind":"retry"}', ages=(100000, 60), extra_chat=('{"pick":2}',))
-            note = await bot._relook_note("再试一试，能不能认出来昨天那张图里的角色", HISTORY, 7, True, 1)
+            # 候选按新到旧排：1 是 60 秒前的，2 是 100000 秒前的
+            bot, paths = relook_bot(tmp, judge='{"kind":"retry","pick":2}', ages=(100000, 60))
+            note = await bot._relook_note("我相信你可以的", HISTORY, 7, True, 1)       # 没有任何“再、试、认”之类的字
             self.assertIn("对方要求你再认一次图里的角色", note)
-            self.assertEqual(bot.vision.prepare_relook.await_args.args[0], paths[0])        # 选了昨天那张
+            self.assertEqual(bot.vision.prepare_relook.await_args.args[0], paths[0])        # 选了较旧的那张
             self.assertNotIn("爱丽丝", str(bot.character_identifier.identify.await_args))   # 再试一次时不带“被否定的猜测”
 
-    async def test_a_retry_without_a_time_word_uses_the_newest_recent_image_without_asking_a_model(self):
+    async def test_the_models_pick_is_honored_even_when_the_speaker_sent_an_image_too(self):
         with tempfile.TemporaryDirectory() as tmp:
-            bot, paths = relook_bot(tmp, judge='{"kind":"retry"}', ages=(100000, 60))
-            await bot._relook_note("你再试试看呢？", [{"role": "user", "content": "x"}], 7, True, 1)
+            # 发言的人 7 自己有一张较旧的图；模型认为他说的是别人刚发的那张，就按模型的来，不靠“谁发的”这种规则
+            bot, paths = relook_bot(tmp, judge='{"kind":"retry","pick":1}', ages=(120, 30), uids=["7", "9"])
+            await bot._relook_note("继续猜这张图", HISTORY, 7, True, 1)
             self.assertEqual(bot.vision.prepare_relook.await_args.args[0], paths[1])
-            self.assertEqual(bot.utility_llm.chat.await_count, 2)       # 意图判断 + 搜索词，没有多出“选图”这次
+            asked = bot.utility_llm.chat.await_args_list[0].args[0][1]["content"]
+            self.assertIn("现在说话的人自己发的图", asked)          # 只是提供信息，不是硬规则
+            self.assertIn("不要只因为某张图最新就选它", asked)
+            self.assertEqual(bot.utility_llm.chat.await_count, 2)   # 一次判断（意图加选图）+ 一次搜索词
 
     async def test_a_vague_retry_is_resolved_from_the_conversation_not_only_the_sentence(self):
         with tempfile.TemporaryDirectory() as tmp:
-            bot, paths = relook_bot(tmp, judge='{"kind":"retry"}', ages=(100000, 90000), extra_chat=('{"pick":1}',))
+            bot, paths = relook_bot(tmp, judge='{"kind":"retry","pick":1}', ages=(100000, 90000))
             talk = [{"role": "user", "content": "[哥哥] 再试一试，能不能认出来昨天那张图里的角色"},
                     {"role": "assistant", "content": "金发星形发饰加黑黄上衣白裙，我没对上号"}]
             await bot._relook_note("我相信你可以的，再试一试", talk, 7, True, 1)
-            asked = bot.utility_llm.chat.await_args_list[1].args[0][1]["content"]     # 第二次调用是“选图”
+            asked = bot.utility_llm.chat.await_args_list[0].args[0][1]["content"]
             self.assertIn("金发星形发饰加黑黄上衣白裙", asked)                         # 带上了最近对话
             self.assertIn("昨天那张图里的角色", asked)
             self.assertEqual(bot.vision.prepare_relook.await_args.args[0], paths[1])   # 编号 1 是列表里最新的那张
-
-    async def test_no_saved_image_means_nothing_to_look_at(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            bot, _ = relook_bot(tmp, judge='{"kind":"retry"}', ages=(10 ** 7,))
-            self.assertEqual(await bot._relook_note("再试一试", HISTORY, 7, True, 1), "")
-            bot.vision.prepare_relook.assert_not_awaited()
 
 
 class CharacterIdentifierTests(unittest.IsolatedAsyncioTestCase):
