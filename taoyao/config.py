@@ -295,6 +295,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "relook": {
         "enabled": True,
+        "max_side": 1280,
         "candidate_max_age_seconds": 172800,
         "timeout_seconds": 70,
         "identify": True,

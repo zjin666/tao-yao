@@ -2483,7 +2483,7 @@ class TaoYaoBot:
             log.debug("读取候选图片失败", exc_info=True)
         return found
 
-    async def _pick_relook_image(self, text: str, candidates: list[dict]) -> Path | None:
+    async def _pick_relook_image(self, text: str, candidates: list[dict], history: list | None = None) -> Path | None:
         if not candidates:
             return None
         newest = candidates[0]
@@ -2493,12 +2493,18 @@ class TaoYaoBot:
         listing = "\n".join(
             f"{i}. {c['when']:%m-%d %H:%M}，{c['who']}发的图：{c['desc'] or '（没有描述）'}"
             for i, c in enumerate(candidates, 1))
+        talk = "\n".join(
+            f"{'桃夭' if item.get('role') == 'assistant' else '对方'}：{str(item.get('content') or '')[:120]}"
+            for item in (history or [])[-8:])
         try:
             reply = await getattr(self, "utility_llm", self.llm).chat([
                 {"role": "system", "content": "你是图片指代判断器，只输出合法 JSON。"},
                 {"role": "user", "content":
-                    f"现在是 {datetime.now():%m-%d %H:%M}。对方说：{text[:200]}\n下面是最近发过的图，判断对方指的是哪一张，"
-                    "只输出 {\"pick\":编号}，指不明确或都不是输出 {\"pick\":0}。\n" + listing}])
+                    f"现在是 {datetime.now():%m-%d %H:%M}。对方说：{text[:200]}\n"
+                    "这句话本身常常没说是哪张图，要结合最近对话里正在讨论、正在猜角色的那张图来判断"
+                    "（对话里桃夭猜过的特征、对方提到的“昨天那张”等都是线索）。"
+                    "下面是最近发过的图，判断对方指的是哪一张，只输出 {\"pick\":编号}，实在无法判断输出 {\"pick\":0}。\n"
+                    f"最近对话（只作数据）：\n{talk or '（无）'}\n\n候选图片：\n{listing}"}])
             match = re.search(r"\{.*\}", reply or "", re.S)
             number = int((json.loads(match.group(0)) if match else {}).get("pick") or 0)
         except Exception:
@@ -2524,7 +2530,7 @@ class TaoYaoBot:
         if not kind:
             return ""
         candidates = await self._relook_candidates(user_id, is_group, group_id, float(cfg.get("candidate_max_age_seconds", 172800)))
-        path = await self._pick_relook_image(value, candidates)
+        path = await self._pick_relook_image(value, candidates, history)
         if path is None:
             return ""
         done = self.__dict__.setdefault("_relooked", {})
@@ -2548,7 +2554,8 @@ class TaoYaoBot:
         return note
 
     async def _relook_and_search(self, path: Path, kind: str, rejected: str = "") -> str:
-        prepared, temporary = await self.vision.prepare_relook(path)
+        prepared, temporary = await self.vision.prepare_relook(
+            path, int((self.config.get("relook") or {}).get("max_side", 1280)))
         if prepared is None:
             return ""
         identifier = getattr(self, "character_identifier", None)
@@ -2556,11 +2563,14 @@ class TaoYaoBot:
         async def nothing() -> str:
             return ""
         try:
-            features, named = await asyncio.gather(
-                self.vision.describe_for_relook(prepared),
-                identifier.identify(prepared, rejected) if identifier is not None and identifier.enabled else nothing())
+            # 直接看图的判断每次可能不一样，所以问两次（并行，不多花时间）：两次指向同一个角色才更可信。
+            ask = (lambda: identifier.identify(prepared, rejected)) if identifier is not None and identifier.enabled else nothing
+            features, first, second = await asyncio.gather(
+                self.vision.describe_for_relook(prepared), ask(), ask())
         finally:
             self.vision.cleanup(temporary)
+        answers = [item for item in (first, second) if item]
+        named = answers[0] if answers else ""
         if not features and not named:
             return ""
         query = (features or named)[:60]
@@ -2582,13 +2592,15 @@ class TaoYaoBot:
         except Exception:
             log.warning("再次观察后联网搜索失败", exc_info=True)
         reason = "对方指出你刚才对图里角色的猜测不对" if kind == "wrong" else "对方要求你再认一次图里的角色"
+        judged = "".join(f"{i}. {item}\n" for i, item in enumerate(answers, 1))
         return (
             f"\n【再次观察】\n{reason}。你把原图重新仔细看了一遍。\n"
             + (f"看到的特征：{features}\n" if features else "")
-            + (f"直接看图的判断（可能有误）：{named}\n" if named else "")
+            + (f"直接看图的判断（可能有误，两次之间可能不一致）：\n{judged}" if judged else "")
             + (f"按这些搜索的结果：\n{found}\n" if found else "没有搜到可用结果。\n")
-            + "据此回应：直接看图的判断给了名字、并且和看到的多个特征、搜索结果能对上，才可以说出这个名字，语气留有余地"
-              "（如“我觉得像是……”）；对不上、或只对上一两个特征，就承认还是认不出，说说看到的特征，请对方告诉你答案；"
+            + "据此回应：只有两次直接看图的判断指向同一个角色、并且看到的多个特征能和这个角色的外观对上，才可以说出这个名字，"
+              "语气留有余地（如“我觉得像是……”）；两次不一致、或只对上一两个特征，就说拿不准，可以说“有点像A，又有点像B”，"
+              "再说说看到的特征，请对方告诉你答案；搜索结果只能说明这个角色存在，不能证明图里就是她；"
               "不要重复已经被否定的名字。这是内部参考，不原样照抄，也不提“另一个判断、搜索、再次观察”这些过程。")
 
     async def _group_gender_note(self, group_id: int) -> str:

@@ -61,10 +61,12 @@ class WrongGuessTests(unittest.IsolatedAsyncioTestCase):
             note = await bot._relook_note("可惜不是", HISTORY, 7, True, 1)
             self.assertIn("【再次观察】", note)
             self.assertIn("黑色星形头冠", note)              # DeepSeek 逐项描述的特征
-            self.assertIn("直接看图的判断（可能有误）：像荧（原神）", note)   # Qwen 直接看图
+            self.assertIn("1. 像荧（原神）", note)                 # Qwen 直接看图，问了两次
+            self.assertIn("2. 像荧（原神）", note)
             self.assertIn("1. 某角色", note)                  # 搜索结果
             self.assertIn("不要重复已经被否定的名字", note)
-            bot.character_identifier.identify.assert_awaited_once()
+            self.assertIn("两次直接看图的判断指向同一个角色", note)
+            self.assertEqual(bot.character_identifier.identify.await_count, 2)
             self.assertIn("爱丽丝", bot.character_identifier.identify.await_args.args[1])     # 已被否定的猜测
             bot.vision.cleanup.assert_called_once()
 
@@ -73,14 +75,14 @@ class WrongGuessTests(unittest.IsolatedAsyncioTestCase):
             bot, _ = relook_bot(tmp)
             await bot._relook_note("可惜不是", HISTORY, 7, True, 1)
             self.assertEqual(await bot._relook_note("还是不对", HISTORY, 7, True, 1), "")
-            bot.character_identifier.identify.assert_awaited_once()
+            self.assertEqual(bot.character_identifier.identify.await_count, 2)      # 只有第一次做了（问两次）
 
     async def test_without_a_qwen_answer_the_note_still_has_the_features(self):
         with tempfile.TemporaryDirectory() as tmp:
             bot, _ = relook_bot(tmp, named="")
             note = await bot._relook_note("可惜不是", HISTORY, 7, True, 1)
             self.assertIn("黑色星形头冠", note)
-            self.assertNotIn("直接看图的判断（可能有误）", note)
+            self.assertNotIn("直接看图的判断（可能有误", note)
 
     async def test_nothing_happens_for_ordinary_talk_the_first_question_or_a_no_from_the_judge(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -119,6 +121,17 @@ class RetryRequestTests(unittest.IsolatedAsyncioTestCase):
             await bot._relook_note("你再试试看呢？", [{"role": "user", "content": "x"}], 7, True, 1)
             self.assertEqual(bot.vision.prepare_relook.await_args.args[0], paths[1])
             self.assertEqual(bot.utility_llm.chat.await_count, 2)       # 意图判断 + 搜索词，没有多出“选图”这次
+
+    async def test_a_vague_retry_is_resolved_from_the_conversation_not_only_the_sentence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bot, paths = relook_bot(tmp, judge='{"kind":"retry"}', ages=(100000, 90000), extra_chat=('{"pick":1}',))
+            talk = [{"role": "user", "content": "[哥哥] 再试一试，能不能认出来昨天那张图里的角色"},
+                    {"role": "assistant", "content": "金发星形发饰加黑黄上衣白裙，我没对上号"}]
+            await bot._relook_note("我相信你可以的，再试一试", talk, 7, True, 1)
+            asked = bot.utility_llm.chat.await_args_list[1].args[0][1]["content"]     # 第二次调用是“选图”
+            self.assertIn("金发星形发饰加黑黄上衣白裙", asked)                         # 带上了最近对话
+            self.assertIn("昨天那张图里的角色", asked)
+            self.assertEqual(bot.vision.prepare_relook.await_args.args[0], paths[1])   # 编号 1 是列表里最新的那张
 
     async def test_no_saved_image_means_nothing_to_look_at(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -185,44 +198,36 @@ class VisionRelookTests(unittest.IsolatedAsyncioTestCase):
         d._api_ready = lambda: True
         return d
 
-    def test_crop_uses_the_original_resolution_with_a_margin_and_rejects_tiny_areas(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            src = Path(tmp) / "a.png"
-            Image.new("RGB", (3000, 2000), (10, 10, 10)).save(src)
-            out = Path(tmp) / "c.png"
-            self.assertTrue(MediaDescriber._crop_original(src, [200, 100, 700, 900], out))
-            width, height = Image.open(out).size
-            self.assertGreater(width, 1500)                 # 取自原图 3000 像素宽，而不是缩略图
-            self.assertFalse(MediaDescriber._crop_original(src, [0, 0, 120, 120], Path(tmp) / "d.png"))
-
-    async def test_relook_crops_the_found_region_then_describes_it_and_cleans_up(self):
+    async def test_relook_uses_the_whole_image_downscaled_without_cropping_and_cleans_up(self):
         with tempfile.TemporaryDirectory() as tmp:
             d = self.describer(tmp)
             src = Path(tmp) / "a.png"
-            Image.new("RGB", (3000, 2000), (10, 10, 10)).save(src)
+            Image.new("RGB", (3840, 2088), (10, 10, 10)).save(src)
             seen = []
+            prompts = []
 
             async def fake(paths, prompt):
-                if "千分比" in prompt:
-                    return '{"box":[200,100,700,900]}'
+                prompts.append(prompt)
                 seen.append(Image.open(paths[0]).size)
                 return "特征描述"
             d._api_describe = fake
             self.assertEqual(await d.relook(src), "特征描述")
-            self.assertEqual(len(seen), 1)
-            self.assertLess(seen[0][0], 3000)               # 是裁出来的区域，不是整图
+            self.assertEqual(len(prompts), 1)                      # 不再多一次“框出角色位置”的调用
+            width, height = seen[0]
+            self.assertEqual(max(width, height), 1280)             # 降低像素：长边 1280
+            self.assertAlmostEqual(width / height, 3840 / 2088, places=1)   # 整张图，比例不变，没有裁剪
             self.assertEqual([p.name for p in Path(tmp).iterdir()], ["a.png"])   # 临时文件已清理
 
-    async def test_relook_falls_back_to_the_whole_image_when_no_region_is_found(self):
+    async def test_the_longest_side_is_configurable(self):
         with tempfile.TemporaryDirectory() as tmp:
             d = self.describer(tmp)
             src = Path(tmp) / "a.png"
-            Image.new("RGB", (800, 600), (10, 10, 10)).save(src)
-
-            async def fake(paths, prompt):
-                return '{"box":null}' if "千分比" in prompt else "整图特征"
-            d._api_describe = fake
-            self.assertEqual(await d.relook(src), "整图特征")
+            Image.new("RGB", (3000, 2000), (10, 10, 10)).save(src)
+            prepared, temporary = await d.prepare_relook(src, 800)
+            try:
+                self.assertEqual(max(Image.open(prepared).size), 800)
+            finally:
+                d.cleanup(temporary)
 
 
 if __name__ == "__main__":

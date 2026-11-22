@@ -254,7 +254,7 @@ class MediaDescriber:
             log.warning("视频抽帧失败：%s", exc)
             return []
 
-    def _normalize_image(self, path: Path) -> tuple[Path, bool]:
+    def _normalize_image(self, path: Path, max_side: int = 1600) -> tuple[Path, bool]:
         """把大图缩到可上传尺寸并压成 JPEG，避免 10MB 图片转 PNG 后超限。"""
         try:
             from PIL import Image
@@ -269,7 +269,7 @@ class MediaDescriber:
                     image = canvas
                 else:
                     image = image.convert("RGB")
-                image.thumbnail((1600, 1600))
+                image.thumbnail((max_side, max_side))
 
                 # 先降质量，再降尺寸；目标是让 base64 请求体留在安全范围内。
                 for quality in (88, 82, 74, 66, 58):
@@ -416,10 +416,6 @@ class MediaDescriber:
                 "以图片里的神态、动作和文字为准，两者冲突时相信图片；不要复述这句话，"
                 "也不要因此编造画面里没有的内容。")
 
-    BOX_PROMPT = (
-        "找出画面里最主要的角色（人物或生物）整体所在的区域。只输出一行 JSON：{\"box\":[x0,y0,x1,y1]}，"
-        "坐标是相对整张图的千分比（0 到 1000，左上角为原点）。没有角色就输出 {\"box\":null}。"
-    )
     RELOOK_PROMPT = (
         "仔细观察这张图里最主要的角色，逐项写出能用来认出她的特征：发色（含渐变）和发型、头饰（颜色和形状）、"
         "眼睛颜色、服装各部分的颜色和款式、配饰、手持物、指甲，以及画面里能读清的文字（字太小看不清就写“看不清”）。"
@@ -427,72 +423,14 @@ class MediaDescriber:
         "不要用列表和 Markdown 格式，控制在 220 字以内。"
     )
 
-    async def _character_box(self, path: Path) -> list[float] | None:
-        """让视觉模型在缩小的图上框出主要角色的位置（千分比）；框不出来或不可信返回 None。"""
-        try:
-            from PIL import Image
-            thumb = self.work_dir / f"{uuid.uuid4().hex}.jpg"
-            with Image.open(path) as image:
-                image.seek(0)
-                small = image.convert("RGB")
-                small.thumbnail((768, 768))
-                small.save(thumb, "JPEG", quality=80)
-        except Exception as exc:
-            log.debug("生成缩略图失败：%s", exc)
-            return None
-        try:
-            reply = await asyncio.wait_for(self._api_describe([thumb], self.BOX_PROMPT), 15)
-            match = re.search(r"\{.*\}", reply or "", re.S)
-            box = (json.loads(match.group(0)) if match else {}).get("box")
-            if not isinstance(box, list) or len(box) != 4:
-                return None
-            x0, y0, x1, y1 = (float(v) for v in box)
-            if not (0 <= x0 < x1 <= 1000 and 0 <= y0 < y1 <= 1000) or (x1 - x0) < 120 or (y1 - y0) < 120:
-                return None
-            return [x0, y0, x1, y1]
-        except Exception as exc:
-            log.debug("框出角色区域失败：%s", exc)
-            return None
-        finally:
-            try:
-                thumb.unlink()
-            except OSError:
-                pass
-
-    @staticmethod
-    def _crop_original(path: Path, box: list[float], out: Path, margin: float = 0.12) -> bool:
-        """按框（千分比）加边距，从原始分辨率裁出一块；太小就放弃。"""
-        from PIL import Image
-        with Image.open(path) as image:
-            image.seek(0)
-            full = image.convert("RGB")
-            width, height = full.size
-            x0, y0, x1, y1 = box
-            pad_x, pad_y = (x1 - x0) * margin, (y1 - y0) * margin
-            left = max(0, int((x0 - pad_x) / 1000 * width))
-            top = max(0, int((y0 - pad_y) / 1000 * height))
-            right = min(width, int((x1 + pad_x) / 1000 * width))
-            bottom = min(height, int((y1 + pad_y) / 1000 * height))
-            if right - left < 300 or bottom - top < 300:
-                return False
-            full.crop((left, top, right, bottom)).save(out, "PNG")
-            return True
-
-    async def prepare_relook(self, path: Path) -> tuple[Path | None, list[Path]]:
-        """再次观察用的图：先框出角色所在区域，按原始分辨率裁出来再压到可上传大小；框不出来就用整张图。
+    async def prepare_relook(self, path: Path, max_side: int = 1280) -> tuple[Path | None, list[Path]]:
+        """再次观察用的图：不裁剪，整张原图降低像素（长边不超过 max_side）后压成 JPEG。
         返回（图, 用完要删的临时文件）；不可用返回 (None, [])。"""
         temporary: list[Path] = []
         if not self.enabled or not self._api_ready() or not path.exists():
             return None, temporary
         try:
-            target = path
-            box = await self._character_box(path)
-            if box:
-                crop = self.work_dir / f"{uuid.uuid4().hex}.png"
-                temporary.append(crop)
-                if await asyncio.to_thread(self._crop_original, path, box, crop):
-                    target = crop
-            prepared, converted = await asyncio.to_thread(self._normalize_image, target)
+            prepared, converted = await asyncio.to_thread(self._normalize_image, path, max(256, int(max_side)))
             if converted:
                 temporary.append(prepared)
             return prepared, temporary
@@ -517,7 +455,7 @@ class MediaDescriber:
             return ""
 
     async def relook(self, path: Path) -> str:
-        """被指出认错后的再次仔细观察：裁出角色区域逐项描述。失败返回空字符串。"""
+        """被指出认错后的再次仔细观察：整张图降低像素后逐项描述。失败返回空字符串。"""
         prepared, temporary = await self.prepare_relook(path)
         try:
             return await self.describe_for_relook(prepared) if prepared else ""
